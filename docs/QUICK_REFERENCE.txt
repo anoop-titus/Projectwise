@@ -1,0 +1,207 @@
+================================================================================
+                 Claude Project Workflow - Quick Reference
+================================================================================
+
+LAUNCHING
+  claude              Open project selector (fuzzy search)
+  claude --new        Create new project interactively
+  claude --help       Show help information
+
+IN SELECTOR (Type to search, use arrow keys to navigate)
+  ↑ / ↓               Navigate up/down through list
+  Ctrl-F              Toggle: Show favorites only
+  Ctrl-C              Toggle: Filter by category
+  Ctrl-B              Toggle: Browse ALL folders recursively
+  Ctrl-S              Toggle: Preview pane on/off
+  Type                Fuzzy search across all projects
+  Enter               Select project and cd into it
+  Esc                 Cancel, return to shell
+
+HELPER COMMANDS (Use from any directory)
+  claude-favorite     Toggle favorite status for current project
+  claude-info         Show detailed metadata for current project
+  claude-list [MODE]  List projects in different modes:
+                      - quick (recent projects)
+                      - favorite (only favorites)
+                      - category (filter by type)
+                      - browse (all folders)
+  claude-status       Show project statistics and activity summary
+  claude-status --detailed   List all projects with stats
+
+COMMON WORKFLOWS
+
+  Open recent project:
+    $ claude
+    (Press Enter on first item)
+
+  Open favorite:
+    $ claude
+    (Press Ctrl-F)
+    (Select one and press Enter)
+
+  Browse all folders:
+    $ claude
+    (Press Ctrl-B)
+    (Navigate and press Enter)
+
+  Star/unstar project as favorite:
+    $ cd ~/.claude/projects/my-project
+    $ claude-favorite
+
+  See project details:
+    $ cd ~/.claude/projects/my-project
+    $ claude-info
+
+  View all projects:
+    $ claude-status
+
+CATEGORIES (use Ctrl-C to filter in selector)
+  Research            Academic work, literature, experiments
+  Medicine            Health-related projects
+  Leisure             Hobbies, personal interests
+  Productivity        Work tools, automation
+  Finance             Budget, investments, tracking
+  Travel              Trip planning, location research
+  Business            Professional work, clients
+  Stay                Home, personal administration
+
+PROJECT STATUSES
+  active              In use, searchable, appears in quick mode
+  paused              Temporarily inactive, still searchable
+  archived            Completed, usually hidden from searches
+
+KEYBOARD SHORTCUTS IN SELECTOR
+  Type                → Instant fuzzy search (no extra key needed)
+  'test' + Enter      → Select first match or navigate to it
+  ↑ / ↓               → Move up/down in results
+  Ctrl-F              → Show only favorited projects
+  Ctrl-C              → Filter by category
+  Ctrl-B              → Browse all folders with preview
+  Ctrl-S              → Hide/show metadata preview pane
+  Enter               → Select and cd into highlighted project
+  Esc                 → Cancel and return to prompt
+
+FILE LOCATIONS
+  Central registry:        ~/.claude/projects/.registry.json
+  Active symlinks:         ~/.claude/projects/active/
+  Favorites symlinks:      ~/.claude/projects/favorites/
+  Helper scripts:          ~/.claude/scripts/
+  Backup location:         ~/.claude/projects/.registry.json.backup.TIMESTAMP
+  Migration log:           ~/.claude/migration-*.log
+
+TROUBLESHOOTING - Quick Fixes
+
+  FZF not installed?
+    $ nix profile install nixpkgs#fzf
+
+  Projects not showing?
+    $ ~/.claude/scripts/registry-init.sh --force
+
+  Registry corrupted?
+    $ ~/.claude/scripts/registry-recover.sh restore-latest
+
+  Symlinks out of date?
+    $ ~/.claude/scripts/symlink-organize.sh
+
+  Helper commands not found?
+    $ exec zsh
+
+  Selector slow?
+    $ ~/.claude/scripts/registry-init.sh
+
+RECOVERY & SAFETY
+
+  List registry backups:
+    $ ~/.claude/scripts/registry-recover.sh list
+
+  Validate registry:
+    $ ~/.claude/scripts/registry-recover.sh validate
+
+  Restore from backup:
+    $ ~/.claude/scripts/registry-recover.sh restore-latest
+
+  Rollback to old system:
+    $ ~/.claude/scripts/rollback.sh
+
+  Re-enable new system:
+    $ ~/.claude/scripts/migrate.sh --force
+
+METADATA EDITING
+
+  View project metadata:
+    $ cd ~/.claude/projects/my-project
+    $ claude-info
+
+  Toggle favorite:
+    $ claude-favorite
+
+  Edit in registry (advanced):
+    $ nano ~/.claude/projects/.registry.json
+
+  Create per-project overrides:
+    $ cat > ~/.claude/projects/my-project/PROJECT.json << EOF
+    {
+      "description": "New description",
+      "tags": ["tag1", "tag2"],
+      "category": "Research"
+    }
+    EOF
+
+USEFUL COMBINATIONS
+
+  Find and favorite a project:
+    $ claude               # Open selector
+    > research            # Search for projects
+    $ claude-favorite     # From within the project, star it
+
+  Browse and explore:
+    $ claude              # Open selector
+    (Press Ctrl-B)        # Browse mode
+    (Navigate folders)
+    (Press Enter)         # Select project
+
+  Filter by type:
+    $ claude              # Open selector
+    (Press Ctrl-C)        # Filter by category
+    > Research            # Choose category
+    (Press Enter)         # Show only research projects
+
+  See what you use most:
+    $ claude-status       # Shows most accessed projects
+
+METADATA FIELDS (9 per project)
+  display_name      Human-readable project name
+  description       What the project is about
+  tags              Searchable keywords (array)
+  category          Type (Research, Medicine, Leisure, etc.)
+  status            active/paused/archived
+  created           Creation date (ISO format)
+  last_accessed     When you last opened it
+  session_count     How many times you've opened it
+  git_link          GitHub/GitLab URL if available
+
+COMMAND HELP
+
+  $ claude --help                              Show main command help
+  $ registry-recover.sh help                   Registry recovery help
+  $ project-select.sh help                     Selector help
+  $ ~/.claude/scripts/registry-update.sh help  Registry update help
+
+DOCUMENTATION FILES
+
+  PROJECT_WORKFLOW_GUIDE.md  Comprehensive user guide (this is it!)
+  QUICK_REFERENCE.txt        One-page cheat sheet (you are reading this)
+  TROUBLESHOOTING.md         Problem solving guide
+  VERIFICATION.md            Testing and verification checklist
+  ARCHITECTURE.md            Technical architecture overview
+
+MORE INFO
+
+  Complete guide:    ~/.claude/projects/PROJECT_WORKFLOW_GUIDE.md
+  Troubleshooting:   ~/.claude/projects/TROUBLESHOOTING.md
+  Architecture:      ~/.claude/projects/ARCHITECTURE.md
+  Verification:      ~/.claude/projects/VERIFICATION.md
+
+================================================================================
+                            Last Updated: 2026-01-30
+================================================================================
