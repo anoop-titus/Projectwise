@@ -1,0 +1,31 @@
+{
+  "name": "claude-project-manager",
+  "version": "2.0.0",
+  "description": "TUI project manager for Claude Code with FZF selector, metadata preview, and shell integration",
+  "bin": {
+    "claude-pm": "bin/claude-pm",
+    "cpm": "bin/cpm"
+  },
+  "scripts": {
+    "test": "bats tests/*.bats",
+    "install": "scripts/install.sh",
+    "uninstall": "scripts/uninstall.sh"
+  },
+  "keywords": [
+    "claude",
+    "project-manager",
+    "cli",
+    "development",
+    "workflow"
+  ],
+  "author": "Titus",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titus/claude-project-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/titus/claude-project-manager/issues"
+  },
+  "homepage": "https://github.com/titus/claude-project-manager"
+}

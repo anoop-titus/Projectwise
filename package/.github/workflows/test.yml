@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        brew install bats jq fzf
+
+    - name: Run tests
+      run: |
+        cd package
+        bats tests/*.bats
+
+    - name: Verify shell scripts
+      run: |
+        # Check if shellcheck is available
+        if command -v shellcheck &> /dev/null; then
+          shellcheck package/bin/* package/lib/*
+        else
+          echo "shellcheck not available, skipping"
+        fi
+
+    - name: Test installation
+      run: |
+        cd package
+        ./scripts/install.sh ./test-install
+
+    - name: Test basic commands
+      run: |
+        export PATH="./test-install/bin:$PATH"
+        claude-pm help
+        claude-pm version
+        claude-pm registry --help
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Check shell script syntax
+      run: |
+        bash -n package/bin/claude-pm
+        bash -n package/bin/cpm
+        for f in package/lib/*.sh; do
+          bash -n "$f"
+        done
+        for f in package/scripts/*.sh; do
+          bash -n "$f"
+        done

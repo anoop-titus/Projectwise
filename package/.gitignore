@@ -1,0 +1,43 @@
+# Backups and temporary files
+*.backup
+*.backup.*
+*.tmp
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.tar.gz
+*.zip
+
+# Installation artifacts
+test-install/
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+.bats/
+test-*.json
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Nix
+result
+.direnv/
+
+# TLDR
+.tldr/
+.tldrignore
+
+# Misc
+node_modules/
+__pycache__/
+*.pyc

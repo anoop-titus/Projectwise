@@ -1,0 +1,17 @@
+{
+  "name": "my-project",
+  "version": "1.0.0",
+  "description": "My Claude project",
+  "created": "2026-01-30T10:00:00Z",
+  "tags": ["development"],
+  "metadata": {
+    "phases": [
+      {
+        "name": "Setup",
+        "status": "pending",
+        "description": "Initial project setup"
+      }
+    ],
+    "contributors": []
+  }
+}
