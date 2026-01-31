@@ -1,0 +1,18 @@
+# Generated caches
+.cache/
+.tldr/
+
+# Local IDE/editor settings
+.claude/settings.local.json
+
+# One-off scripts
+TEST_FIXES.sh
+
+# OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
