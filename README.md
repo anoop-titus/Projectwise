@@ -16,23 +16,11 @@ interactive project manager for Claude Code workspaces.
 
 ---
 
-```
-$ claude
-  ╭─────────────────────────────────────────────────╮
-  │  Select project              3 matches / 12     │
-  │                                                 │
-  │ > trading-engine        Rust   ★  3 sessions    │
-  │   openclaw-gateway      Python    17 sessions   │
-  │   projectwise           Rust   ★  8 sessions    │
-  │                                                 │
-  │  enter: select  R: rename  F: fav  ctrl-d: arch │
-  ╰─────────────────────────────────────────────────╯
+<div align="center">
 
-  → cd ~/.claude/projects/trading-engine
-  → axon analyze (background)
-  → tldr warm (background)
-  → Entering Claude Code...
-```
+![Projectwise Demo](docs/demo.gif)
+
+</div>
 
 Pick a project. Code intelligence refreshes automatically. You're coding in under two seconds.
 
