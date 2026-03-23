@@ -16,3 +16,8 @@ TEST_FIXES.sh
 
 # Node
 node_modules/
+
+
+# Added by cargo
+
+/target
