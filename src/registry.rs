@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use fs2::FileExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -8,17 +9,34 @@ use crate::models::{ListMode, Project, ProjectStatus, Registry};
 
 pub struct RegistryManager {
     path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl RegistryManager {
     pub fn new(home: &Path) -> Self {
         Self {
             path: home.join(".registry.json"),
+            lock_path: home.join(".registry.lock"),
         }
     }
 
     pub fn exists(&self) -> bool {
         self.path.exists()
+    }
+
+    /// Acquire an exclusive advisory lock for read-modify-write cycles.
+    fn lock_exclusive(&self) -> Result<fs::File> {
+        if let Some(parent) = self.lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.lock_path)
+            .context("failed to open registry lock file")?;
+        lock_file.lock_exclusive().context("failed to acquire exclusive lock on registry")?;
+        Ok(lock_file)
     }
 
     pub fn load(&self) -> Result<Registry> {
@@ -29,11 +47,25 @@ impl RegistryManager {
 
     pub fn save(&self, registry: &Registry) -> Result<()> {
         self.backup()?;
-        let dir = self.path.parent().unwrap();
+        let dir = self.path.parent()
+            .ok_or_else(|| anyhow::anyhow!("registry path has no parent directory"))?;
         let temp = NamedTempFile::new_in(dir).context("failed to create temp file")?;
         serde_json::to_writer_pretty(&temp, registry).context("failed to serialize registry")?;
         temp.persist(&self.path).context("failed to persist registry")?;
         Ok(())
+    }
+
+    /// Locked read-modify-write transaction. Prevents concurrent cpm processes
+    /// from causing lost updates.
+    fn transact<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Registry) -> Result<()>,
+    {
+        let _lock = self.lock_exclusive()?;
+        let mut reg = self.load()?;
+        f(&mut reg)?;
+        reg.metadata.updated = Utc::now();
+        self.save(&reg)
     }
 
     pub fn init(&self) -> Result<()> {
@@ -52,32 +84,37 @@ impl RegistryManager {
     // --- CRUD ---
 
     pub fn add(&self, folder_name: &str, display_name: &str, description: &str, category: &str) -> Result<()> {
-        let mut reg = self.load()?;
-        let now = Utc::now();
-        reg.projects.push(Project {
-            id: folder_name.to_string(),
-            folder_name: folder_name.to_string(),
-            display_name: display_name.to_string(),
-            description: description.to_string(),
-            tags: Vec::new(),
-            category: category.to_string(),
-            status: ProjectStatus::Active,
-            created: now,
-            last_accessed: now,
-            session_count: 0,
-            git_link: None,
-            favorite: false,
-            archive_path: None,
-        });
-        reg.metadata.updated = now;
-        self.save(&reg)
+        let folder_name = folder_name.to_string();
+        let display_name = display_name.to_string();
+        let description = description.to_string();
+        let category = category.to_string();
+        self.transact(|reg| {
+            let now = Utc::now();
+            reg.projects.push(Project {
+                id: folder_name.clone(),
+                folder_name,
+                display_name,
+                description,
+                tags: Vec::new(),
+                category,
+                status: ProjectStatus::Active,
+                created: now,
+                last_accessed: now,
+                session_count: 0,
+                git_link: None,
+                favorite: false,
+                archive_path: None,
+            });
+            Ok(())
+        })
     }
 
     pub fn remove(&self, folder_name: &str) -> Result<()> {
-        let mut reg = self.load()?;
-        reg.projects.retain(|p| p.folder_name != folder_name);
-        reg.metadata.updated = Utc::now();
-        self.save(&reg)
+        let folder_name = folder_name.to_string();
+        self.transact(|reg| {
+            reg.projects.retain(|p| p.folder_name != folder_name);
+            Ok(())
+        })
     }
 
     pub fn get(&self, folder_name: &str) -> Result<Option<Project>> {
@@ -86,49 +123,55 @@ impl RegistryManager {
     }
 
     pub fn touch(&self, folder_name: &str) -> Result<()> {
-        let mut reg = self.load()?;
-        if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
-            p.last_accessed = Utc::now();
-            p.session_count += 1;
-        }
-        reg.metadata.updated = Utc::now();
-        self.save(&reg)
+        let folder_name = folder_name.to_string();
+        self.transact(|reg| {
+            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+                p.last_accessed = Utc::now();
+                p.session_count += 1;
+            }
+            Ok(())
+        })
     }
 
     pub fn set_field(&self, folder_name: &str, field: &str, value: &str) -> Result<()> {
-        let mut reg = self.load()?;
-        let project = reg.projects.iter_mut()
-            .find(|p| p.folder_name == folder_name)
-            .with_context(|| format!("project not found: {folder_name}"))?;
+        let folder_name = folder_name.to_string();
+        let field = field.to_string();
+        let value = value.to_string();
+        self.transact(|reg| {
+            let project = reg.projects.iter_mut()
+                .find(|p| p.folder_name == folder_name)
+                .with_context(|| format!("project not found: {folder_name}"))?;
 
-        match field {
-            "display_name" => project.display_name = value.to_string(),
-            "description" => project.description = value.to_string(),
-            "category" => project.category = value.to_string(),
-            "status" => project.status = value.parse()?,
-            "git_link" => project.git_link = if value.is_empty() { None } else { Some(value.to_string()) },
-            _ => anyhow::bail!("unknown field: {field}"),
-        }
-        reg.metadata.updated = Utc::now();
-        self.save(&reg)
+            match field.as_str() {
+                "display_name" => project.display_name = value.clone(),
+                "description" => project.description = value.clone(),
+                "category" => project.category = value.clone(),
+                "status" => project.status = value.parse()?,
+                "git_link" => project.git_link = if value.is_empty() { None } else { Some(value.clone()) },
+                _ => anyhow::bail!("unknown field: {field}"),
+            }
+            Ok(())
+        })
     }
 
     pub fn toggle_favorite(&self, folder_name: &str) -> Result<()> {
-        let mut reg = self.load()?;
-        if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
-            p.favorite = !p.favorite;
-        }
-        reg.metadata.updated = Utc::now();
-        self.save(&reg)
+        let folder_name = folder_name.to_string();
+        self.transact(|reg| {
+            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+                p.favorite = !p.favorite;
+            }
+            Ok(())
+        })
     }
 
     pub fn set_tags(&self, folder_name: &str, tags: Vec<String>) -> Result<()> {
-        let mut reg = self.load()?;
-        if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
-            p.tags = tags;
-        }
-        reg.metadata.updated = Utc::now();
-        self.save(&reg)
+        let folder_name = folder_name.to_string();
+        self.transact(|reg| {
+            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+                p.tags = tags.clone();
+            }
+            Ok(())
+        })
     }
 
     pub fn list_sorted(&self, mode: ListMode) -> Result<Vec<Project>> {
@@ -151,7 +194,8 @@ impl RegistryManager {
 
     fn backup(&self) -> Result<()> {
         if !self.exists() { return Ok(()); }
-        let backup_dir = self.path.parent().unwrap().join(".backups");
+        let backup_dir = self.path.parent()
+            .ok_or_else(|| anyhow::anyhow!("registry path has no parent"))?.join(".backups");
         fs::create_dir_all(&backup_dir)?;
         let ts = Utc::now().timestamp();
         fs::copy(&self.path, backup_dir.join(format!("registry.{ts}.backup")))?;

@@ -19,6 +19,7 @@ tempfile = "3"
 dirs = "5"
 anyhow = "1"
 walkdir = "2"
+fs2 = "0.4"
 
 [profile.release]
 strip = true

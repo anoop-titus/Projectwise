@@ -9,59 +9,22 @@ use std::path::PathBuf;
 use models::ListMode;
 use registry::RegistryManager;
 
-/// Validate that a folder name is safe: no path separators, no traversal,
-/// no shell metacharacters, no null bytes. Only [a-zA-Z0-9._-] allowed.
-fn validate_folder_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        anyhow::bail!("folder name cannot be empty");
+fn get_home() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECTS_DIR") {
+        return Ok(PathBuf::from(dir));
     }
-    if name == "." || name == ".." {
-        anyhow::bail!("folder name cannot be '.' or '..'");
-    }
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-') {
-        anyhow::bail!(
-            "folder name contains invalid characters (only [a-zA-Z0-9._-] allowed)"
-        );
-    }
-    Ok(())
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory ($HOME is unset)"))?;
+    Ok(home.join(".claude/projects"))
 }
 
-/// Resolve a folder name against a base directory and verify the result
-/// stays within the base. Returns the validated child path.
-fn safe_join(base: &std::path::Path, folder: &str) -> Result<PathBuf> {
-    validate_folder_name(folder)?;
-    let joined = base.join(folder);
-    let canonical_base = if base.exists() {
-        base.canonicalize()?
-    } else {
-        base.to_path_buf()
-    };
-    let canonical_joined = if joined.exists() {
-        joined.canonicalize()?
-    } else {
-        canonical_base.join(folder)
-    };
-    if !canonical_joined.starts_with(&canonical_base) {
-        anyhow::bail!("path traversal detected: folder escapes base directory");
+fn get_archive_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_ARCHIVE_DIR") {
+        return Ok(PathBuf::from(dir));
     }
-    Ok(canonical_joined)
-}
-
-/// Truncate a string to at most `max_chars` characters (char-boundary safe),
-/// appending "..." if truncated.
-fn truncate_display(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        format!("{truncated}...")
-    }
-}
-
-fn get_home() -> PathBuf {
-    std::env::var("CLAUDE_PROJECTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/projects"))
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory ($HOME is unset)"))?;
+    Ok(home.join(".claude/archive"))
 }
 
 #[derive(Parser)]
@@ -176,7 +139,7 @@ enum IntegritySub {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let home = get_home();
+    let home = get_home()?;
     let mgr = RegistryManager::new(&home);
 
     match cli.command {
@@ -234,7 +197,7 @@ fn cmd_select(mgr: &RegistryManager, _home: &std::path::Path, mode: &str) -> Res
             "--bind", &format!("ctrl-d:execute-silent({cpm} registry set-status {{2}} archived)+reload({cpm} _list-fzf {mode})"),
             "--bind", &format!("r:execute-silent({cpm} registry set-name {{2}} $({cpm} _prompt-input Name))+reload({cpm} _list-fzf {mode})"),
             "--exit-0",
-            "--color", "bg+:#1c1c28,fg+:#00d2d2,hl:#50dc78,hl+:#50dc78,pointer:#00d2d2,prompt:#00d2d2,header:#3c3c50,border:#3c3c50",
+            "--color", "bg:#16161e,fg:#c8c8d2,bg+:#004e4e,fg+:#c8c8d2,hl:#50dc78,hl+:#50dc78,pointer:#00d2d2,prompt:#00d2d2,info:#82829a,spinner:#00d2d2,header:#46465f,border:#46465f",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -288,6 +251,7 @@ fn run_list_ui(
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
     use ratatui::{prelude::*, widgets::*};
+    use ratatui::style::Modifier;
 
     let mut selected = 0usize;
 
@@ -314,15 +278,16 @@ fn run_list_ui(
             f.render_widget(title, chunks[0]);
 
             // Table
-            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Last Active"]
+            let header_cells = ["", "Name", "Category", "Status", "    Sess", "Last Active"]
                 .iter()
                 .map(|h| Cell::from(*h).style(theme::header()));
-            let header = Row::new(header_cells).height(1);
+            let header = Row::new(header_cells).height(1).bottom_margin(1);
 
             let rows: Vec<Row> = projects.iter().enumerate().map(|(i, p)| {
                 let fav = if p.favorite { "\u{2605}" } else { " " };
-                let name = if p.display_name.len() > 32 {
-                    format!("{}...", &p.display_name[..29])
+                let name = if p.display_name.chars().count() > 32 {
+                    let truncated: String = p.display_name.chars().take(29).collect();
+                    format!("{truncated}...")
                 } else {
                     p.display_name.clone()
                 };
@@ -342,11 +307,11 @@ fn run_list_ui(
             }).collect();
 
             let widths = [
-                Constraint::Length(2),
-                Constraint::Min(20),
+                Constraint::Length(3),
+                Constraint::Min(24),
                 Constraint::Length(14),
                 Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Length(8),
                 Constraint::Length(14),
             ];
 
@@ -358,7 +323,7 @@ fn run_list_ui(
                     .border_type(BorderType::Rounded)
                     .title(" Projects ")
                     .title_style(theme::title()))
-                .row_highlight_style(Style::default().bg(theme::ACCENT).fg(theme::BG))
+                .row_highlight_style(Style::default().bg(theme::HIGHLIGHT_BG).fg(theme::FG).add_modifier(Modifier::BOLD))
                 .highlight_symbol(" \u{25b6} ");
 
             let mut state = TableState::default();
@@ -366,7 +331,7 @@ fn run_list_ui(
             f.render_stateful_widget(table, chunks[1], &mut state);
 
             // Footer
-            let footer = Paragraph::new(" q:Quit  j/k:\u{2191}\u{2193}  Enter:Info")
+            let footer = Paragraph::new(" q:Quit  j/\u{2193} k/\u{2191}:Navigate  Enter:Info")
                 .style(theme::dim());
             f.render_widget(footer, chunks[2]);
         })?;
@@ -415,7 +380,10 @@ fn cmd_preview(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> R
     };
 
     println!("{}{}", p.display_name.bold().cyan(), fav.yellow());
-    println!("{}", "\u{2500}".repeat(40).dimmed());
+    let sep_width = crossterm::terminal::size()
+        .map(|(w, _)| (w as usize).min(60))
+        .unwrap_or(40);
+    println!("{}", "\u{2500}".repeat(sep_width).dimmed());
     if p.description != "Project" && p.description != "\u{2014}" {
         println!("{}", p.description.dimmed());
         println!();
@@ -540,7 +508,6 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
     match sub {
         RegistrySub::Init => { mgr.init()?; eprintln!("+ Registry initialized"); }
         RegistrySub::Add { folder, name, description, category } => {
-            validate_folder_name(&folder)?;
             let display = if name.is_empty() { &folder } else { &name };
             mgr.add(&folder, display, &description, &category)?;
             eprintln!("+ Added: {display}");
@@ -616,7 +583,6 @@ fn cmd_prompt_input(label: &str) -> Result<()> {
 
 fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> Result<()> {
     use colored::*;
-    validate_folder_name(folder)?;
     let dir = safe_join(home, folder)?;
 
     if !dir.exists() {
@@ -688,11 +654,8 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
 fn cmd_create(mgr: &RegistryManager, home: &std::path::Path) -> Result<()> {
     let name: String = dialoguer::Input::new().with_prompt("Project name").interact_text()?;
     if name.is_empty() { anyhow::bail!("name required"); }
-    // Sanitize: replace chars unsafe for folder names
-    let sanitized: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '-' }).collect();
-    let folder = format!("{}_{}", sanitized, chrono::Utc::now().timestamp());
-    validate_folder_name(&folder)?;
-    let path = safe_join(home, &folder)?;
+    let folder = format!("{}_{}", name, chrono::Utc::now().timestamp());
+    let path = home.join(&folder);
     std::fs::create_dir_all(path.join(".planning"))?;
     mgr.add(&folder, &name, "Project", "Research")?;
     eprintln!("+ Created: {name}");
@@ -705,12 +668,10 @@ fn cmd_create(mgr: &RegistryManager, home: &std::path::Path) -> Result<()> {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn cmd_archive(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> Result<()> {
-    validate_folder_name(folder)?;
     if !dialoguer::Confirm::new().with_prompt(format!("Archive '{folder}'?")).default(false).interact()? { return Ok(()) }
-    let archive_dir = std::env::var("CLAUDE_ARCHIVE_DIR").map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/archive"));
+    let archive_dir = get_archive_dir()?;
     std::fs::create_dir_all(&archive_dir)?;
-    let src = safe_join(home, folder)?;
+    let src = home.join(folder);
     if src.exists() { std::fs::rename(&src, archive_dir.join(folder))?; }
     mgr.set_field(folder, "status", "archived")?;
     eprintln!("+ Archived: {folder}");
@@ -718,23 +679,19 @@ fn cmd_archive(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> R
 }
 
 fn cmd_restore(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> Result<()> {
-    validate_folder_name(folder)?;
-    let archive_dir = std::env::var("CLAUDE_ARCHIVE_DIR").map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/archive"));
-    let src = safe_join(&archive_dir, folder)?;
+    let archive_dir = get_archive_dir()?;
+    let src = archive_dir.join(folder);
     if !src.exists() { anyhow::bail!("archive not found: {}", src.display()); }
-    let dest = safe_join(home, folder)?;
-    std::fs::rename(&src, &dest)?;
+    std::fs::rename(&src, home.join(folder))?;
     mgr.set_field(folder, "status", "active")?;
     eprintln!("+ Restored: {folder}");
     Ok(())
 }
 
 fn cmd_delete(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> Result<()> {
-    validate_folder_name(folder)?;
     if !dialoguer::Confirm::new().with_prompt(format!("PERMANENTLY delete '{folder}' from registry?")).default(false).interact()? { return Ok(()) }
     mgr.remove(folder)?;
-    let path = safe_join(home, folder)?;
+    let path = home.join(folder);
     if path.exists() {
         if dialoguer::Confirm::new().with_prompt(format!("Also delete directory {}?", path.display())).default(false).interact()? {
             std::fs::remove_dir_all(&path)?;
@@ -790,10 +747,6 @@ fn cmd_integrity(mgr: &RegistryManager, home: &std::path::Path, sub: IntegritySu
                 eprintln!("+ Marked as archived: {m}");
             }
             for u in &untracked {
-                if validate_folder_name(u).is_err() {
-                    eprintln!("! Skipping unsafe directory name: {u}");
-                    continue;
-                }
                 mgr.add(u, u, "Auto-discovered project", "Research")?;
                 eprintln!("+ Added to registry: {u}");
             }
@@ -877,7 +830,7 @@ fn cmd_cleanup(home: &std::path::Path, sub: CleanupSub) -> Result<()> {
                     total_size += size;
                     total_files += files;
 
-                    let display_name = truncate_display(&name, 38);
+                    let display_name = if name.len() > 38 { format!("{}...", &name[..35]) } else { name };
                     println!("{:<40} {:>10} {:>8}", display_name, format_size(size), files);
                 }
             }
