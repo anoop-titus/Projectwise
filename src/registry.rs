@@ -17,10 +17,6 @@ impl RegistryManager {
         }
     }
 
-    pub fn registry_path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn exists(&self) -> bool {
         self.path.exists()
     }
