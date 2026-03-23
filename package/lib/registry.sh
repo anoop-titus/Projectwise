@@ -8,7 +8,6 @@ if [[ -n "${CLAUDE_PM_REGISTRY_SOURCED:-}" ]]; then
 fi
 export CLAUDE_PM_REGISTRY_SOURCED=1
 
-# Include guard for core.sh
 if [[ -z "${CLAUDE_PM_CORE_SOURCED:-}" ]]; then
   source "$(dirname "${BASH_SOURCE[0]}")/core.sh"
 fi
@@ -50,15 +49,12 @@ registry_add() {
   local category="${4:-Research}"
 
   [[ -z "$folder_name" ]] && die "Usage: registry_add <folder_name> [display_name] [description] [category]"
-
-  local registry_path
-  registry_path=$(get_registry_path)
   ensure_registry
 
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-  registry_atomic_update_args \
+  registry_atomic_update \
     --arg fn "$folder_name" \
     --arg dn "$display_name" \
     --arg desc "$description" \
@@ -89,7 +85,8 @@ registry_remove() {
   ensure_registry
 
   registry_atomic_update \
-    "(.projects) |= map(select(.folder_name != \"$folder_name\"))"
+    --arg fn "$folder_name" \
+    '(.projects) |= map(select(.folder_name != $fn))'
 
   print_success "Removed project: $folder_name"
 }
@@ -100,7 +97,8 @@ registry_get_project() {
   [[ -z "$folder_name" ]] && return 1
   ensure_registry
 
-  jq ".projects[] | select(.folder_name == \"$folder_name\")" "$(get_registry_path)"
+  jq --arg fn "$folder_name" \
+    '.projects[] | select(.folder_name == $fn)' "$(get_registry_path)"
 }
 
 # List all project folder_names
@@ -109,7 +107,7 @@ registry_list_names() {
   jq -r '.projects[].folder_name' "$(get_registry_path)"
 }
 
-# Update a field on a project
+# Update a single string field on a project (safe via --arg)
 registry_set_field() {
   local folder_name="$1"
   local field="$2"
@@ -117,7 +115,10 @@ registry_set_field() {
   ensure_registry
 
   registry_atomic_update \
-    "(.projects[] | select(.folder_name == \"$folder_name\") | .$field) |= \"$value\""
+    --arg fn "$folder_name" \
+    --arg val "$value" \
+    --arg field "$field" \
+    '(.projects[] | select(.folder_name == $fn) | .[$field]) |= $val'
 }
 
 # Update last_accessed timestamp
@@ -133,7 +134,8 @@ registry_increment_sessions() {
   local folder_name="$1"
   ensure_registry
   registry_atomic_update \
-    "(.projects[] | select(.folder_name == \"$folder_name\") | .session_count) |= (. + 1)"
+    --arg fn "$folder_name" \
+    '(.projects[] | select(.folder_name == $fn) | .session_count) |= (. + 1)'
 }
 
 # Toggle favorite
@@ -141,17 +143,15 @@ registry_toggle_favorite() {
   local folder_name="$1"
   ensure_registry
   registry_atomic_update \
-    "(.projects[] | select(.folder_name == \"$folder_name\") | .favorite) |= (. | not)"
+    --arg fn "$folder_name" \
+    '(.projects[] | select(.folder_name == $fn) | .favorite) |= not'
 }
 
-# Set display name
-registry_set_display_name() {
-  local folder_name="$1"
-  local display_name="$2"
-  registry_set_field "$folder_name" "display_name" "$display_name"
-}
+registry_set_display_name() { registry_set_field "$1" "display_name" "$2"; }
+registry_set_category()     { registry_set_field "$1" "category" "$2"; }
+registry_set_description()  { registry_set_field "$1" "description" "$2"; }
 
-# Set status
+# Set status (validates allowed values)
 registry_set_status() {
   local folder_name="$1"
   local status="$2"
@@ -159,21 +159,7 @@ registry_set_status() {
   registry_set_field "$folder_name" "status" "$status"
 }
 
-# Set category
-registry_set_category() {
-  local folder_name="$1"
-  local category="$2"
-  registry_set_field "$folder_name" "category" "$category"
-}
-
-# Set description
-registry_set_description() {
-  local folder_name="$1"
-  local description="$2"
-  registry_set_field "$folder_name" "description" "$description"
-}
-
-# Set tags (comma-separated string)
+# Set tags (comma-separated string → JSON array)
 registry_set_tags() {
   local folder_name="$1"
   local tags_str="$2"
@@ -182,26 +168,27 @@ registry_set_tags() {
   local tags_json
   tags_json=$(echo "$tags_str" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
 
-  registry_atomic_update_args \
+  registry_atomic_update \
     --argjson tags "$tags_json" \
     --arg fn "$folder_name" \
     '(.projects[] | select(.folder_name == $fn) | .tags) |= $tags'
 }
 
-# Set git link
+# Set git link (pass empty string to clear)
 registry_set_git_link() {
   local folder_name="$1"
   local url="$2"
+  ensure_registry
   if [[ -z "$url" ]]; then
-    ensure_registry
     registry_atomic_update \
-      "(.projects[] | select(.folder_name == \"$folder_name\") | .git_link) |= null"
+      --arg fn "$folder_name" \
+      '(.projects[] | select(.folder_name == $fn) | .git_link) |= null'
   else
     registry_set_field "$folder_name" "git_link" "$url"
   fi
 }
 
-# Get projects as JSON array, sorted by last_accessed desc, filtered by mode
+# Get projects sorted by last_accessed desc, optionally filtered by mode
 registry_get_sorted() {
   local mode="${1:-quick}"
   local registry_path
@@ -225,19 +212,19 @@ registry_get_sorted() {
 registry_main() {
   local subcommand="${1:-help}"
   case "$subcommand" in
-    init)           registry_init ;;
-    add)            registry_add "$2" "$3" "$4" "$5" ;;
-    remove)         registry_remove "$2" ;;
-    list)           registry_list_names ;;
-    get)            registry_get_project "$2" ;;
-    touch)          registry_touch "$2" ;;
-    set-name)       registry_set_display_name "$2" "$3" ;;
-    set-status)     registry_set_status "$2" "$3" ;;
-    set-category)   registry_set_category "$2" "$3" ;;
+    init)            registry_init ;;
+    add)             registry_add "$2" "$3" "$4" "$5" ;;
+    remove)          registry_remove "$2" ;;
+    list)            registry_list_names ;;
+    get)             registry_get_project "$2" ;;
+    touch)           registry_touch "$2" ;;
+    set-name)        registry_set_display_name "$2" "$3" ;;
+    set-status)      registry_set_status "$2" "$3" ;;
+    set-category)    registry_set_category "$2" "$3" ;;
     set-description) registry_set_description "$2" "$3" ;;
-    set-tags)       registry_set_tags "$2" "$3" ;;
-    set-git)        registry_set_git_link "$2" "$3" ;;
-    toggle-fav)     registry_toggle_favorite "$2" ;;
+    set-tags)        registry_set_tags "$2" "$3" ;;
+    set-git)         registry_set_git_link "$2" "$3" ;;
+    toggle-fav)      registry_toggle_favorite "$2" ;;
     help|--help|-h)
       cat << 'HELP'
 Registry commands:
@@ -251,9 +238,9 @@ Registry commands:
   set-status <folder> <status>   Set status (active|paused|archived)
   set-category <folder> <cat>    Set category
   set-description <folder> <d>   Set description
-  set-tags <folder> <csv-tags>   Set tags
-  set-git <folder> <url>         Set git link
-  toggle-fav <folder>            Toggle favorite
+  set-tags <folder> <csv-tags>   Set tags (comma-separated)
+  set-git <folder> <url>         Set git link (empty to clear)
+  toggle-fav <folder>            Toggle favorite flag
 HELP
       ;;
     *) die "Unknown registry command: $subcommand" ;;

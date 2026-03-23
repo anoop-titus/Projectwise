@@ -25,5 +25,5 @@ rm -rf "${LIB_DIR}"
 
 echo -e "${COLOR_RED}✓ Uninstallation complete${COLOR_NC}"
 echo ""
-echo "Note: Registry at ~/.claude/registry.json was NOT removed"
-echo "Remove manually if needed: rm ~/.claude/registry.json"
+echo "Note: Registry at ~/.claude/projects/.registry.json was NOT removed"
+echo "Remove manually if needed: rm ~/.claude/projects/.registry.json"

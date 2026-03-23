@@ -30,7 +30,6 @@ for dir in ~/projects ~/work ~/dev ~/.claude/projects; do
     
     for subdir in "${dir}"/*; do
       if [[ -d "${subdir}" && "${subdir}" != "${dir}/."* ]]; then
-        local project_name
         project_name=$(basename "${subdir}")
         
         read -p "Add '${project_name}' to registry? (y/n): " add_project

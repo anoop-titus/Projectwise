@@ -3,6 +3,12 @@
 # Note: Callers should set 'set -euo pipefail' if desired.
 # We don't set it here to avoid affecting sourced scripts unexpectedly.
 
+# Guard against double-sourcing (prevents readonly re-declaration errors)
+if [[ -n "${CLAUDE_PM_CORE_SOURCED:-}" ]]; then
+  return 0
+fi
+export CLAUDE_PM_CORE_SOURCED=1
+
 # Color codes
 readonly CPM_RED='\033[0;31m'
 readonly CPM_GREEN='\033[0;32m'
@@ -66,7 +72,7 @@ prompt_confirm() {
   fi
 }
 
-# Prompt for choice — uses gum if available, else select
+# Prompt for choice — uses gum if available, else numbered menu
 # Validates input and returns empty string on invalid choice
 prompt_choose() {
   local header="$1"
@@ -111,56 +117,22 @@ validate_json() {
   jq empty "$1" 2>/dev/null
 }
 
-# Atomic registry update: apply jq filter, validate, backup, swap
-# Limits backup files to last 10 versions
+# Atomic registry update: apply jq expression + optional --arg/--argjson flags, validate, backup, swap.
+# Usage: registry_atomic_update [--arg key val] ... 'jq_filter'
+# Keeps last 10 backups.
 registry_atomic_update() {
-  local jq_filter="$1"
   local registry_path
   registry_path=$(get_registry_path)
 
   local temp_file
   temp_file=$(mktemp) || { print_error "Failed to create temp file"; return 1; }
 
-  # Manual cleanup instead of trap RETURN to avoid stacking issues
-  if jq "$jq_filter" "$registry_path" > "$temp_file" && validate_json "$temp_file"; then
-    # Create dated backup
-    local backup_dir
-    backup_dir="$(dirname "$registry_path")/.backups"
-    mkdir -p "$backup_dir"
-    cp "$registry_path" "${backup_dir}/registry.$(date +%s).backup"
-
-    # Keep only last 10 backups
-    (cd "$backup_dir" && ls -t registry.*.backup 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true)
-
-    mv "$temp_file" "$registry_path"
-    return 0
-  else
-    rm -f "$temp_file"
-    print_error "Registry update failed"
-    return 1
-  fi
-}
-
-# Atomic registry update with --arg/--argjson support
-# Limits backup files to last 10 versions
-registry_atomic_update_args() {
-  local registry_path
-  registry_path=$(get_registry_path)
-
-  local temp_file
-  temp_file=$(mktemp) || { print_error "Failed to create temp file"; return 1; }
-
-  # Manual cleanup instead of trap RETURN to avoid stacking issues
   if jq "$@" "$registry_path" > "$temp_file" && validate_json "$temp_file"; then
-    # Create dated backup
     local backup_dir
     backup_dir="$(dirname "$registry_path")/.backups"
     mkdir -p "$backup_dir"
     cp "$registry_path" "${backup_dir}/registry.$(date +%s).backup"
-
-    # Keep only last 10 backups
     (cd "$backup_dir" && ls -t registry.*.backup 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true)
-
     mv "$temp_file" "$registry_path"
     return 0
   else
@@ -170,21 +142,15 @@ registry_atomic_update_args() {
   fi
 }
 
-# Convert ISO timestamp to relative time (macOS + Linux)
-# Handles UTC timestamps and common timezone formats
+# Convert ISO timestamp to relative time (Linux-first, macOS fallback)
 relative_time() {
   local ts="$1"
   [[ -z "$ts" || "$ts" == "null" ]] && echo "—" && return
 
   local unix_ts now diff
-  # Try multiple timestamp formats (handle timezone offsets)
   unix_ts=$(
-    # Try macOS format first (UTC)
-    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null ||
-    # Try GNU date format
     date -d "$ts" +%s 2>/dev/null ||
-    # Try removing timezone info and parsing as UTC
-    date -d "${ts%%+*}" +%s 2>/dev/null ||
+    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null ||
     echo 0
   )
   [[ $unix_ts -eq 0 ]] && echo "—" && return
@@ -197,9 +163,8 @@ relative_time() {
   elif ((diff < 86400));  then echo "$((diff / 3600))h ago"
   elif ((diff < 604800)); then echo "$((diff / 86400))d ago"
   else
-    # Format as month/day
-    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%b %d" 2>/dev/null ||
     date -d "$ts" "+%b %d" 2>/dev/null ||
+    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%b %d" 2>/dev/null ||
     echo "—"
   fi
 }

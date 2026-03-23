@@ -12,25 +12,28 @@ preview_project() {
   local registry_path
   registry_path=$(get_registry_path)
 
-  local project_data
-  project_data=$(jq ".projects[] | select(.folder_name == \"$folder_name\" or .id == \"$folder_name\")" "$registry_path" 2>/dev/null)
+  # Extract all fields in a single jq call
+  local fields
+  fields=$(jq -r --arg fn "$folder_name" '
+    .projects[] | select(.folder_name == $fn or .id == $fn) |
+    [
+      (.display_name // "—"),
+      (.description // "—"),
+      ([ .tags[]? ] | join(",")),
+      (.category // "—"),
+      (.status // "—"),
+      (.created // "—"),
+      (.last_accessed // "—"),
+      ((.session_count // 0) | tostring),
+      (.git_link // "—"),
+      ((.favorite // false) | tostring)
+    ] | join("\u0000")
+  ' "$registry_path" 2>/dev/null)
 
-  [[ -z "$project_data" ]] && echo "Project not found: $folder_name" && return 0
+  [[ -z "$fields" ]] && echo "Project not found: $folder_name" && return 0
 
-  local display_name description tags category status
-  local created last_accessed session_count git_link
-
-  display_name=$(echo "$project_data" | jq -r '.display_name // "—"')
-  description=$(echo "$project_data" | jq -r '.description // "—"')
-  tags=$(echo "$project_data" | jq -r '.tags[]? // empty' | tr '\n' ',' | sed 's/,$//')
-  category=$(echo "$project_data" | jq -r '.category // "—"')
-  status=$(echo "$project_data" | jq -r '.status // "—"')
-  created=$(echo "$project_data" | jq -r '.created // "—"')
-  last_accessed=$(echo "$project_data" | jq -r '.last_accessed // "—"')
-  session_count=$(echo "$project_data" | jq -r '.session_count // 0')
-  git_link=$(echo "$project_data" | jq -r '.git_link // "—"')
-  local is_favorite
-  is_favorite=$(echo "$project_data" | jq -r '.favorite // false')
+  IFS=$'\0' read -r display_name description tags category status \
+    created last_accessed session_count git_link is_favorite <<< "$fields"
 
   [[ -z "$tags" ]] && tags="—"
 
