@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# Claude Project Manager - Short alias
-# This is a convenience wrapper for: claude-pm
-
-exec "$(dirname "$0")/claude-pm" "$@"
