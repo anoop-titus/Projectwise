@@ -18,7 +18,9 @@ interactive project manager for Claude Code workspaces.
 
 <div align="center">
 
-![Projectwise Demo](docs/demo.gif)
+![Projectwise Workflow](docs/workflow.gif)
+
+*Type `claude` → pick a project → axon + tldr refresh → you're coding.*
 
 </div>
 
