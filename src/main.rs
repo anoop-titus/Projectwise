@@ -215,12 +215,12 @@ fn cmd_select(mgr: &RegistryManager, _home: &std::path::Path, mode: &str) -> Res
     let projects = mgr.list_sorted(mode_parsed)?;
 
     let mut lines = String::new();
-    lines.push_str("  \u{1f4ac} Quick Session\t__QUICK_SESSION__\n");
-    lines.push_str("  \u{2795} New Project\t__NEW_PROJECT__\n");
-    for p in &projects {
+    for p in projects.iter().rev() {
         let fav = if p.favorite { "\u{2605} " } else { "  " };
         lines.push_str(&format!("{fav}{}\t{}\n", p.display_name, p.folder_name));
     }
+    lines.push_str("  \u{2795} New Project\t__NEW_PROJECT__\n");
+    lines.push_str("  \u{1f4ac} Quick Session\t__QUICK_SESSION__\n");
 
     let cpm = std::env::current_exe()?.display().to_string();
 
@@ -595,12 +595,12 @@ claude() {{
 
 fn cmd_list_fzf(mgr: &RegistryManager, mode: &str) -> Result<()> {
     let mode: ListMode = mode.parse().unwrap_or(ListMode::Quick);
-    println!("  \u{1f4ac} Quick Session\t__QUICK_SESSION__");
-    println!("  \u{2795} New Project\t__NEW_PROJECT__");
-    for p in mgr.list_sorted(mode)? {
+    for p in mgr.list_sorted(mode)?.iter().rev() {
         let fav = if p.favorite { "\u{2605} " } else { "  " };
         println!("{fav}{}\t{}", p.display_name, p.folder_name);
     }
+    println!("  \u{2795} New Project\t__NEW_PROJECT__");
+    println!("  \u{1f4ac} Quick Session\t__QUICK_SESSION__");
     Ok(())
 }
 
