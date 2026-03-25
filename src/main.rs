@@ -1,6 +1,8 @@
 mod models;
 mod registry;
 mod theme;
+mod sessions;
+mod filetree;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -65,7 +67,7 @@ fn get_home() -> PathBuf {
 }
 
 #[derive(Parser)]
-#[command(name = "cpm", version = "3.1.0", about = "Claude Project Manager")]
+#[command(name = "cpm", version = "3.2.0", about = "Claude Project Manager")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -177,6 +179,7 @@ enum IntegritySub {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = get_home();
+    theme::init_theme();
     let mgr = RegistryManager::new(&home);
 
     match cli.command {
@@ -187,12 +190,12 @@ fn main() -> Result<()> {
             };
             cmd_select(&mgr, &home, mode_str)
         }
-        Some(Commands::List { mode }) => cmd_list(&mgr, &mode),
+        Some(Commands::List { mode }) => cmd_list(&mgr, &home, &mode),
         Some(Commands::Preview { folder }) => cmd_preview(&mgr, &home, &folder),
         Some(Commands::Info { folder }) => cmd_info(&mgr, &folder),
         Some(Commands::Registry { sub }) => cmd_registry(&mgr, sub),
         Some(Commands::ShellInit) => cmd_shell_init(),
-        Some(Commands::Version) => { println!("Claude Project Manager v3.1.0"); Ok(()) }
+        Some(Commands::Version) => { println!("Claude Project Manager v3.2.0"); Ok(()) }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
         Some(Commands::PromptInput { label }) => cmd_prompt_input(&label),
         Some(Commands::PreLaunch { folder }) => cmd_pre_launch(&mgr, &home, &folder),
@@ -215,7 +218,7 @@ fn cmd_select(mgr: &RegistryManager, _home: &std::path::Path, mode: &str) -> Res
     let projects = mgr.list_sorted(mode_parsed)?;
 
     let mut lines = String::new();
-    for p in projects.iter().rev() {
+    for p in projects.iter() {
         let fav = if p.favorite { "\u{2605} " } else { "  " };
         lines.push_str(&format!("{fav}{}\t{}\n", p.display_name, p.folder_name));
     }
@@ -257,10 +260,10 @@ fn cmd_select(mgr: &RegistryManager, _home: &std::path::Path, mode: &str) -> Res
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// List — Full Ratatui table
+// List — Full Ratatui table (3-panel layout)
 // ═══════════════════════════════════════════════════════════════════════
 
-fn cmd_list(mgr: &RegistryManager, mode: &str) -> Result<()> {
+fn cmd_list(mgr: &RegistryManager, home: &std::path::Path, mode: &str) -> Result<()> {
     use crossterm::{execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode, disable_raw_mode}};
     use ratatui::prelude::*;
     use std::io;
@@ -268,66 +271,144 @@ fn cmd_list(mgr: &RegistryManager, mode: &str) -> Result<()> {
     let mode_parsed: ListMode = mode.parse().unwrap_or(ListMode::Quick);
     let projects = mgr.list_sorted(mode_parsed)?;
 
+    // Compute sizes once at startup
+    let sizes = compute_sizes(&projects, home);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_list_ui(&mut terminal, &projects, mode);
+    let result = run_list_ui(&mut terminal, &projects, &sizes, home, mode);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     result
 }
 
+/// Compute sizes for all projects in parallel with home dir
+pub fn compute_sizes(projects: &[models::Project], base: &std::path::Path) -> Vec<u64> {
+    projects.iter().map(|p| {
+        let dir = base.join(&p.folder_name);
+        if dir.exists() { dir_size(&dir) } else { 0 }
+    }).collect()
+}
+
+/// Format bytes as human-readable string
+pub fn human_size(bytes: u64) -> String {
+    format_size(bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FocusPanel {
+    Table,
+    Tree,
+    Info,
+}
+
+impl FocusPanel {
+    fn next(self) -> Self {
+        match self {
+            FocusPanel::Table => FocusPanel::Tree,
+            FocusPanel::Tree => FocusPanel::Info,
+            FocusPanel::Info => FocusPanel::Table,
+        }
+    }
+}
+
 fn run_list_ui(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     projects: &[models::Project],
+    sizes: &[u64],
+    home: &std::path::Path,
     mode: &str,
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
     use ratatui::{prelude::*, widgets::*};
 
     let mut selected = 0usize;
+    let mut focus = FocusPanel::Table;
+
+    // Build file tree for initially selected project
+    let mut tree_state = if let Some(p) = projects.first() {
+        let dir = home.join(&p.folder_name);
+        if dir.exists() {
+            Some(filetree::FileTreeState::new(&dir))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     loop {
+        // Rebuild flat list each frame (cheap for small trees)
+        let flat = tree_state.as_ref().map(|ts| filetree::flatten(&ts.root)).unwrap_or_default();
+
         terminal.draw(|f| {
             let area = f.area();
+            let width = area.width;
 
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(5),
-                    Constraint::Length(1),
-                ])
-                .split(area);
+            // Responsive layout
+            let (show_tree, show_info) = if width < 80 {
+                (false, false)
+            } else if width < 120 {
+                (true, false)
+            } else {
+                (true, true)
+            };
+
+            let vertical_chunks = if show_tree {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // title
+                        Constraint::Percentage(55), // table
+                        Constraint::Percentage(40), // bottom panels
+                        Constraint::Length(1),  // footer
+                    ])
+                    .split(area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(5),
+                        Constraint::Length(1),
+                    ])
+                    .split(area)
+            };
 
             // Title bar
-            let title = Paragraph::new(format!(" Claude Project Manager \u{2500} {} ({} projects)", mode, projects.len()))
-                .style(theme::title())
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme::border())
-                    .border_type(BorderType::Rounded));
-            f.render_widget(title, chunks[0]);
+            let title = Paragraph::new(format!(
+                " Claude Project Manager \u{2500} {} ({} projects)",
+                mode, projects.len()
+            ))
+            .style(theme::title())
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::border())
+                .border_type(BorderType::Rounded));
+            f.render_widget(title, vertical_chunks[0]);
 
-            // Table
-            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Last Active"]
+            // Table (panel index 1)
+            let table_border_style = if focus == FocusPanel::Table {
+                Style::default().fg(theme::ACCENT)
+            } else {
+                theme::border()
+            };
+
+            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Size"]
                 .iter()
                 .map(|h| Cell::from(*h).style(theme::header()));
             let header = Row::new(header_cells).height(1);
 
             let rows: Vec<Row> = projects.iter().enumerate().map(|(i, p)| {
                 let fav = if p.favorite { "\u{2605}" } else { " " };
-                let name = if p.display_name.len() > 32 {
-                    format!("{}...", &p.display_name[..29])
-                } else {
-                    p.display_name.clone()
-                };
-                let rel = relative_time(&p.last_accessed);
+                let name = truncate_display(&p.display_name, 32);
                 let status_str = p.status.to_string();
+                let size_str = if i < sizes.len() { human_size(sizes[i]) } else { "—".to_string() };
 
                 let base = if i % 2 == 0 { theme::row_normal() } else { theme::row_alt() };
 
@@ -337,7 +418,7 @@ fn run_list_ui(
                     Cell::from(p.category.clone()).style(base),
                     Cell::from(status_str.clone()).style(theme::status_style(&status_str)),
                     Cell::from(format!("{:>4}", p.session_count)).style(base),
-                    Cell::from(rel).style(theme::dim()),
+                    Cell::from(size_str).style(theme::dim()),
                 ])
             }).collect();
 
@@ -347,44 +428,203 @@ fn run_list_ui(
                 Constraint::Length(14),
                 Constraint::Length(10),
                 Constraint::Length(10),
-                Constraint::Length(14),
+                Constraint::Length(8),
             ];
 
             let table = Table::new(rows, widths)
                 .header(header)
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .border_style(theme::border())
+                    .border_style(table_border_style)
                     .border_type(BorderType::Rounded)
                     .title(" Projects ")
                     .title_style(theme::title()))
                 .row_highlight_style(Style::default().bg(theme::ACCENT).fg(theme::BG))
                 .highlight_symbol(" \u{25b6} ");
 
-            let mut state = TableState::default();
-            if !projects.is_empty() { state.select(Some(selected)); }
-            f.render_stateful_widget(table, chunks[1], &mut state);
+            let mut table_widget_state = TableState::default();
+            if !projects.is_empty() { table_widget_state.select(Some(selected)); }
+            f.render_stateful_widget(table, vertical_chunks[1], &mut table_widget_state);
+
+            // Bottom panels
+            if show_tree {
+                let bottom_area = vertical_chunks[2];
+                let bottom_chunks = if show_info {
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(bottom_area)
+                } else {
+                    Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(100)])
+                        .split(bottom_area)
+                };
+
+                // Dir tree
+                if let Some(ref ts) = tree_state {
+                    filetree::render_tree(
+                        ts,
+                        &flat,
+                        bottom_chunks[0],
+                        f,
+                        focus == FocusPanel::Tree,
+                        "Directory Tree",
+                    );
+                } else {
+                    let border_style = if focus == FocusPanel::Tree {
+                        Style::default().fg(theme::ACCENT)
+                    } else {
+                        theme::border()
+                    };
+                    let block = Block::default()
+                        .title(" Directory Tree ")
+                        .borders(Borders::ALL)
+                        .border_style(border_style)
+                        .border_type(BorderType::Rounded);
+                    f.render_widget(block, bottom_chunks[0]);
+                }
+
+                // Info panel
+                if show_info {
+                    let info_border_style = if focus == FocusPanel::Info {
+                        Style::default().fg(theme::ACCENT)
+                    } else {
+                        theme::border()
+                    };
+
+                    let info_text = if let Some(p) = projects.get(selected) {
+                        let size_str = if selected < sizes.len() { human_size(sizes[selected]) } else { "—".to_string() };
+                        let tags_str = if p.tags.is_empty() { "—".to_string() } else { p.tags.join(", ") };
+                        let git_str = p.git_link.as_deref().unwrap_or("—");
+                        let last_str = relative_time(&p.last_accessed);
+                        vec![
+                            Line::from(vec![
+                                Span::styled("Desc:     ", theme::dim()),
+                                Span::styled(truncate_display(&p.description, 30), theme::row_normal()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Tags:     ", theme::dim()),
+                                Span::styled(tags_str, Style::default().fg(theme::ACCENT)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Git:      ", theme::dim()),
+                                Span::styled(truncate_display(git_str, 30), theme::dim()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Created:  ", theme::dim()),
+                                Span::styled(p.created.format("%Y-%m-%d").to_string(), theme::row_normal()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Last:     ", theme::dim()),
+                                Span::styled(last_str, theme::row_normal()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Sessions: ", theme::dim()),
+                                Span::styled(p.session_count.to_string(), theme::row_normal()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Size:     ", theme::dim()),
+                                Span::styled(size_str, theme::row_normal()),
+                            ]),
+                        ]
+                    } else {
+                        vec![Line::from("No project selected")]
+                    };
+
+                    let info = Paragraph::new(info_text)
+                        .block(Block::default()
+                            .title(" Project Info ")
+                            .borders(Borders::ALL)
+                            .border_style(info_border_style)
+                            .border_type(BorderType::Rounded));
+                    f.render_widget(info, bottom_chunks[1]);
+                }
+            }
 
             // Footer
-            let footer = Paragraph::new(" q:Quit  j/k:\u{2191}\u{2193}  Enter:Info")
-                .style(theme::dim());
-            f.render_widget(footer, chunks[2]);
+            let footer_text = if show_tree {
+                " q:Quit  j/k:\u{2191}\u{2193}  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  Enter:Open"
+            } else {
+                " q:Quit  j/k:\u{2191}\u{2193}  d:Dashboard  t:Theme  Enter:Open"
+            };
+            let footer_idx = if show_tree { vertical_chunks.len() - 1 } else { 2 };
+            let footer = Paragraph::new(footer_text).style(theme::dim());
+            f.render_widget(footer, vertical_chunks[footer_idx]);
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab => {
+                        focus = focus.next();
+                    }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !projects.is_empty() { selected = (selected + 1) % projects.len(); }
+                        match focus {
+                            FocusPanel::Table => {
+                                if !projects.is_empty() {
+                                    selected = (selected + 1) % projects.len();
+                                    // Update tree for new selection
+                                    let dir = home.join(&projects[selected].folder_name);
+                                    tree_state = if dir.exists() {
+                                        Some(filetree::FileTreeState::new(&dir))
+                                    } else {
+                                        None
+                                    };
+                                }
+                            }
+                            FocusPanel::Tree => {
+                                let flat = tree_state.as_ref().map(|ts| filetree::flatten(&ts.root)).unwrap_or_default();
+                                if let Some(ref mut ts) = tree_state {
+                                    ts.select_next(flat.len());
+                                }
+                            }
+                            FocusPanel::Info => {}
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !projects.is_empty() { selected = (selected + projects.len() - 1) % projects.len(); }
+                        match focus {
+                            FocusPanel::Table => {
+                                if !projects.is_empty() {
+                                    selected = (selected + projects.len() - 1) % projects.len();
+                                    let dir = home.join(&projects[selected].folder_name);
+                                    tree_state = if dir.exists() {
+                                        Some(filetree::FileTreeState::new(&dir))
+                                    } else {
+                                        None
+                                    };
+                                }
+                            }
+                            FocusPanel::Tree => {
+                                let flat = tree_state.as_ref().map(|ts| filetree::flatten(&ts.root)).unwrap_or_default();
+                                if let Some(ref mut ts) = tree_state {
+                                    ts.select_prev(flat.len());
+                                }
+                            }
+                            FocusPanel::Info => {}
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if focus == FocusPanel::Tree {
+                            let flat = tree_state.as_ref().map(|ts| filetree::flatten(&ts.root)).unwrap_or_default();
+                            if let Some(ref mut ts) = tree_state {
+                                ts.toggle_selected(&flat);
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        run_dashboard_ui(terminal)?;
+                    }
+                    KeyCode::Char('t') => {
+                        if run_theme_picker(terminal)? {
+                            // Theme changed — restart list UI with same state
+                            return run_list_ui(terminal, projects, sizes, home, mode);
+                        }
                     }
                     KeyCode::Enter => {
                         if let Some(p) = projects.get(selected) {
                             let json = serde_json::to_string_pretty(&p)?;
-                            // Will be printed after TUI cleanup in cmd_list
                             eprintln!("{json}");
                             return Ok(());
                         }
@@ -395,6 +635,281 @@ fn run_list_ui(
         }
     }
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Dashboard Screen
+// ═══════════════════════════════════════════════════════════════════════
+
+fn run_dashboard_ui(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode};
+    use ratatui::{prelude::*, widgets::*};
+
+    loop {
+        // Load data
+        let day_counts = sessions::aggregate_by_day().unwrap_or_default();
+        let top = sessions::top_projects(5).unwrap_or_default();
+        let weekday = sessions::activity_by_weekday().unwrap_or([0u64; 7]);
+        let trend = sessions::last_n_days(30).unwrap_or_default();
+
+        terminal.draw(|f| {
+            let area = f.area();
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),   // title
+                    Constraint::Length(12),  // calendar
+                    Constraint::Min(8),      // bar charts
+                    Constraint::Length(4),   // sparkline
+                    Constraint::Length(1),   // footer
+                ])
+                .split(area);
+
+            // Title
+            let title = Paragraph::new(" Claude Usage Dashboard — Last 52 Weeks")
+                .style(theme::title())
+                .block(Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::border())
+                    .border_type(BorderType::Rounded));
+            f.render_widget(title, chunks[0]);
+
+            // Calendar heatmap — 52 weeks × 7 days block character grid
+            {
+                let today = chrono::Utc::now().date_naive();
+                let start = today - chrono::Duration::weeks(52);
+
+                let weeks = 52usize;
+                let mut rows: Vec<String> = vec![String::new(); 7];
+                for week_offset in 0..weeks {
+                    let week_start = start + chrono::Duration::weeks(week_offset as i64);
+                    for (day_offset, row) in rows.iter_mut().enumerate() {
+                        let d = week_start + chrono::Duration::days(day_offset as i64);
+                        let count = day_counts.get(&d).copied().unwrap_or(0);
+                        let ch = match count {
+                            0 => '░',
+                            1..=2 => '▒',
+                            3..=5 => '▓',
+                            _ => '█',
+                        };
+                        row.push(ch);
+                    }
+                }
+                let day_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let lines: Vec<Line> = rows.iter().enumerate().map(|(i, row)| {
+                    Line::from(format!("{} {}", day_labels[i], row))
+                }).collect();
+
+                let heatmap = Paragraph::new(lines)
+                    .style(Style::default().fg(theme::ACCENT))
+                    .block(Block::default()
+                        .title(" Activity Heatmap (52 weeks) ")
+                        .borders(Borders::ALL)
+                        .border_style(theme::border())
+                        .border_type(BorderType::Rounded));
+                f.render_widget(heatmap, chunks[1]);
+            }
+
+            // Bar charts row
+            {
+                let bar_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(chunks[2]);
+
+                // Top projects bar chart
+                let proj_data: Vec<Bar> = top.iter().map(|(name, count)| {
+                    Bar::default()
+                        .value(*count)
+                        .label(Line::from(truncate_display(name, 14)))
+                        .style(Style::default().fg(theme::ACCENT))
+                }).collect();
+
+                let proj_group = BarGroup::default().bars(&proj_data);
+                let proj_chart = BarChart::default()
+                    .block(Block::default()
+                        .title(" Top Projects ")
+                        .borders(Borders::ALL)
+                        .border_style(theme::border())
+                        .border_type(BorderType::Rounded))
+                    .data(proj_group)
+                    .bar_width(3)
+                    .bar_gap(1)
+                    .value_style(Style::default().fg(theme::BG).bg(theme::ACCENT))
+                    .label_style(Style::default().fg(theme::DIM));
+                f.render_widget(proj_chart, bar_chunks[0]);
+
+                // Weekday bar chart
+                let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let wd_bars: Vec<Bar> = weekday.iter().enumerate().map(|(i, &count)| {
+                    Bar::default()
+                        .value(count)
+                        .label(Line::from(day_names[i]))
+                        .style(Style::default().fg(theme::ACCENT))
+                }).collect();
+                let wd_group = BarGroup::default().bars(&wd_bars);
+                let wd_chart = BarChart::default()
+                    .block(Block::default()
+                        .title(" Activity by Weekday ")
+                        .borders(Borders::ALL)
+                        .border_style(theme::border())
+                        .border_type(BorderType::Rounded))
+                    .data(wd_group)
+                    .bar_width(3)
+                    .bar_gap(1)
+                    .value_style(Style::default().fg(theme::BG).bg(theme::ACCENT))
+                    .label_style(Style::default().fg(theme::DIM));
+                f.render_widget(wd_chart, bar_chunks[1]);
+            }
+
+            // Sparkline 30-day trend
+            {
+                let spark = Sparkline::default()
+                    .block(Block::default()
+                        .title(" 30-day trend ")
+                        .borders(Borders::ALL)
+                        .border_style(theme::border())
+                        .border_type(BorderType::Rounded))
+                    .data(&trend)
+                    .style(Style::default().fg(theme::ACCENT));
+                f.render_widget(spark, chunks[3]);
+            }
+
+            // Footer
+            let footer = Paragraph::new(" q/Esc:Back  r:Refresh").style(theme::dim());
+            f.render_widget(footer, chunks[4]);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('r') => {} // just loop — data reloaded each draw
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Theme picker modal
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Returns true if a theme was applied (caller should re-render)
+fn run_theme_picker(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> Result<bool> {
+    use crossterm::event::{self, Event, KeyCode};
+    use ratatui::{prelude::*, widgets::*};
+
+    let themes = theme::available_themes();
+    let current_theme = theme::current_theme_name();
+    let mut selected = 0usize;
+    let mut dark_only = true;
+
+    for (i, &(id, _)) in themes.iter().enumerate() {
+        if id == current_theme {
+            selected = i;
+            break;
+        }
+    }
+
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let popup_width = 52u16.min(area.width.saturating_sub(4));
+            let popup_height = 16u16.min(area.height.saturating_sub(4));
+            let popup_area = Rect::new(
+                area.width.saturating_sub(popup_width) / 2,
+                area.height.saturating_sub(popup_height) / 2,
+                popup_width,
+                popup_height,
+            );
+
+            // Dim background with Clear
+            f.render_widget(Clear, popup_area);
+
+            let block = Block::default()
+                .title(format!(" Select Theme {} ", if dark_only { "(Dark)" } else { "(All)" }))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::ACCENT))
+                .border_type(BorderType::Rounded);
+            let inner = block.inner(popup_area);
+            f.render_widget(block, popup_area);
+
+            let mut lines = Vec::new();
+            for (i, &(id, name)) in themes.iter().enumerate() {
+                if dark_only && !theme::is_theme_dark(id) {
+                    continue;
+                }
+                let style = if i == selected {
+                    Style::default().bg(theme::ACCENT).fg(theme::BG)
+                } else {
+                    Style::default().fg(theme::FG)
+                };
+                let prefix = if i == selected { "> " } else { "  " };
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", prefix, name),
+                    style,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " L:Toggle light  j/k:Nav  Enter:Apply  q:Cancel",
+                theme::dim(),
+            )));
+
+            let para = Paragraph::new(lines);
+            f.render_widget(para, inner);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    KeyCode::Char('L') | KeyCode::Char('l') => {
+                        dark_only = !dark_only;
+                        selected = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let next = (selected + 1..themes.len())
+                            .find(|&i| !dark_only || theme::is_theme_dark(themes[i].0));
+                        if let Some(n) = next {
+                            selected = n;
+                        } else {
+                            // Wrap around
+                            if let Some(n) = (0..themes.len()).find(|&i| !dark_only || theme::is_theme_dark(themes[i].0)) {
+                                selected = n;
+                            }
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let prev = (0..selected).rev()
+                            .find(|&i| !dark_only || theme::is_theme_dark(themes[i].0));
+                        if let Some(p) = prev {
+                            selected = p;
+                        } else {
+                            // Wrap around
+                            if let Some(p) = (0..themes.len()).rev().find(|&i| !dark_only || theme::is_theme_dark(themes[i].0)) {
+                                selected = p;
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let selected_theme = themes[selected].0.to_string();
+                        let _ = theme::set_theme(&selected_theme);
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -465,7 +980,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
     eprintln!("Editing: {}", project.display_name);
     eprintln!("(press Enter to keep current value)\n");
 
-    // Display name
     let name: String = dialoguer::Input::new()
         .with_prompt("Display name")
         .default(project.display_name.clone())
@@ -474,7 +988,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
         mgr.set_field(folder, "display_name", &name)?;
     }
 
-    // Description
     let desc: String = dialoguer::Input::new()
         .with_prompt("Description")
         .default(project.description.clone())
@@ -483,7 +996,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
         mgr.set_field(folder, "description", &desc)?;
     }
 
-    // Category
     let cat: String = dialoguer::Input::new()
         .with_prompt("Category")
         .default(project.category.clone())
@@ -492,7 +1004,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
         mgr.set_field(folder, "category", &cat)?;
     }
 
-    // Status
     let statuses = &["active", "paused", "archived"];
     let current_idx = statuses.iter().position(|s| *s == project.status.to_string()).unwrap_or(0);
     let status_idx = dialoguer::Select::new()
@@ -505,7 +1016,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
         mgr.set_field(folder, "status", new_status)?;
     }
 
-    // Tags
     let current_tags = project.tags.join(", ");
     let tags_str: String = dialoguer::Input::new()
         .with_prompt("Tags (comma-separated)")
@@ -517,7 +1027,6 @@ fn cmd_edit(mgr: &RegistryManager, folder: &str) -> Result<()> {
         mgr.set_tags(folder, tags)?;
     }
 
-    // Git link
     let current_git = project.git_link.clone().unwrap_or_default();
     let git: String = dialoguer::Input::new()
         .with_prompt("Git link")
@@ -567,7 +1076,7 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 
 fn cmd_shell_init() -> Result<()> {
     print!(r#"# Claude Project Manager — shell integration
-# Generated by cpm shell-init v3.1.0
+# Generated by cpm shell-init v3.2.0
 claude() {{
   command -v claude &>/dev/null || {{ echo "Error: claude CLI not found" >&2; return 127; }}
   [[ "$*" =~ (--help|--version|-h|-v) ]] && {{ command claude "$@"; return $?; }}
@@ -595,7 +1104,7 @@ claude() {{
 
 fn cmd_list_fzf(mgr: &RegistryManager, mode: &str) -> Result<()> {
     let mode: ListMode = mode.parse().unwrap_or(ListMode::Quick);
-    for p in mgr.list_sorted(mode)?.iter().rev() {
+    for p in mgr.list_sorted(mode)?.iter() {
         let fav = if p.favorite { "\u{2605} " } else { "  " };
         println!("{fav}{}\t{}", p.display_name, p.folder_name);
     }
@@ -624,7 +1133,6 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
         return Ok(());
     }
 
-    // Refresh axon (background)
     if cmd_exists("axon") {
         let d = dir.display().to_string();
         std::thread::spawn(move || {
@@ -637,7 +1145,6 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
         eprintln!("{} axon analyze (background)", "\u{2713}".green());
     }
 
-    // Refresh tldr (background)
     if cmd_exists("tldr") {
         let d = dir.clone();
         std::thread::spawn(move || {
@@ -651,7 +1158,6 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
         eprintln!("{} tldr warm (background)", "\u{2713}".green());
     }
 
-    // Refresh claude-context (background)
     if cmd_exists("claude-context") {
         let d = dir.clone();
         std::thread::spawn(move || {
@@ -666,8 +1172,9 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
     }
 
     let _ = mgr.touch(folder);
+    // Task 1: log session for stats
+    let _ = sessions::log_session(folder);
 
-    // Doc review
     let docs: Vec<&str> = ["PROJECT.md", "README.md", "PLAN.md", "PROGRESS.md"]
         .iter().filter(|f| dir.join(f).exists()).copied().collect();
     if !docs.is_empty() {
@@ -688,7 +1195,6 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
 fn cmd_create(mgr: &RegistryManager, home: &std::path::Path) -> Result<()> {
     let name: String = dialoguer::Input::new().with_prompt("Project name").interact_text()?;
     if name.is_empty() { anyhow::bail!("name required"); }
-    // Sanitize: replace chars unsafe for folder names
     let sanitized: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '-' }).collect();
     let folder = format!("{}_{}", sanitized, chrono::Utc::now().timestamp());
     validate_folder_name(&folder)?;
@@ -833,7 +1339,6 @@ fn cmd_cleanup(home: &std::path::Path, sub: CleanupSub) -> Result<()> {
                 }
             }
 
-            // Also prune registry backups
             let backup_dir = home.join(".backups");
             if backup_dir.exists() {
                 for entry in std::fs::read_dir(&backup_dir)? {
@@ -876,7 +1381,6 @@ fn cmd_cleanup(home: &std::path::Path, sub: CleanupSub) -> Result<()> {
                         .count();
                     total_size += size;
                     total_files += files;
-
                     let display_name = truncate_display(&name, 38);
                     println!("{:<40} {:>10} {:>8}", display_name, format_size(size), files);
                 }

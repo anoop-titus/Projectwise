@@ -20,6 +20,8 @@ dirs = "5"
 anyhow = "1"
 walkdir = "2"
 fs2 = "0.4"
+opaline = { version = "0.4.0", features = ["builtin-themes", "ratatui"] }
+toml = "0.8"
 
 [profile.release]
 strip = true
