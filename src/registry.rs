@@ -35,23 +35,32 @@ impl RegistryManager {
             .truncate(false)
             .open(&self.lock_path)
             .context("failed to open registry lock file")?;
-        lock_file.lock_exclusive().context("failed to acquire exclusive lock on registry")?;
+        lock_file
+            .lock_exclusive()
+            .context("failed to acquire exclusive lock on registry")?;
         Ok(lock_file)
     }
 
     pub fn load(&self) -> Result<Registry> {
-        let data = fs::read_to_string(&self.path)
-            .with_context(|| format!("registry not found at {}. Run 'cpm registry init'", self.path.display()))?;
+        let data = fs::read_to_string(&self.path).with_context(|| {
+            format!(
+                "registry not found at {}. Run 'cpm registry init'",
+                self.path.display()
+            )
+        })?;
         serde_json::from_str(&data).context("failed to parse registry JSON")
     }
 
     pub fn save(&self, registry: &Registry) -> Result<()> {
         self.backup()?;
-        let dir = self.path.parent()
+        let dir = self
+            .path
+            .parent()
             .ok_or_else(|| anyhow::anyhow!("registry path has no parent directory"))?;
         let temp = NamedTempFile::new_in(dir).context("failed to create temp file")?;
         serde_json::to_writer_pretty(&temp, registry).context("failed to serialize registry")?;
-        temp.persist(&self.path).context("failed to persist registry")?;
+        temp.persist(&self.path)
+            .context("failed to persist registry")?;
         Ok(())
     }
 
@@ -83,7 +92,13 @@ impl RegistryManager {
 
     // --- CRUD ---
 
-    pub fn add(&self, folder_name: &str, display_name: &str, description: &str, category: &str) -> Result<()> {
+    pub fn add(
+        &self,
+        folder_name: &str,
+        display_name: &str,
+        description: &str,
+        category: &str,
+    ) -> Result<()> {
         let folder_name = folder_name.to_string();
         let display_name = display_name.to_string();
         let description = description.to_string();
@@ -119,13 +134,20 @@ impl RegistryManager {
 
     pub fn get(&self, folder_name: &str) -> Result<Option<Project>> {
         let reg = self.load()?;
-        Ok(reg.projects.into_iter().find(|p| p.folder_name == folder_name))
+        Ok(reg
+            .projects
+            .into_iter()
+            .find(|p| p.folder_name == folder_name))
     }
 
     pub fn touch(&self, folder_name: &str) -> Result<()> {
         let folder_name = folder_name.to_string();
         self.transact(|reg| {
-            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+            if let Some(p) = reg
+                .projects
+                .iter_mut()
+                .find(|p| p.folder_name == folder_name)
+            {
                 p.last_accessed = Utc::now();
                 p.session_count += 1;
             }
@@ -138,7 +160,9 @@ impl RegistryManager {
         let field = field.to_string();
         let value = value.to_string();
         self.transact(|reg| {
-            let project = reg.projects.iter_mut()
+            let project = reg
+                .projects
+                .iter_mut()
                 .find(|p| p.folder_name == folder_name)
                 .with_context(|| format!("project not found: {folder_name}"))?;
 
@@ -147,7 +171,13 @@ impl RegistryManager {
                 "description" => project.description = value.clone(),
                 "category" => project.category = value.clone(),
                 "status" => project.status = value.parse()?,
-                "git_link" => project.git_link = if value.is_empty() { None } else { Some(value.clone()) },
+                "git_link" => {
+                    project.git_link = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    }
+                }
                 _ => anyhow::bail!("unknown field: {field}"),
             }
             Ok(())
@@ -157,7 +187,11 @@ impl RegistryManager {
     pub fn toggle_favorite(&self, folder_name: &str) -> Result<()> {
         let folder_name = folder_name.to_string();
         self.transact(|reg| {
-            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+            if let Some(p) = reg
+                .projects
+                .iter_mut()
+                .find(|p| p.folder_name == folder_name)
+            {
                 p.favorite = !p.favorite;
             }
             Ok(())
@@ -167,7 +201,11 @@ impl RegistryManager {
     pub fn set_tags(&self, folder_name: &str, tags: Vec<String>) -> Result<()> {
         let folder_name = folder_name.to_string();
         self.transact(|reg| {
-            if let Some(p) = reg.projects.iter_mut().find(|p| p.folder_name == folder_name) {
+            if let Some(p) = reg
+                .projects
+                .iter_mut()
+                .find(|p| p.folder_name == folder_name)
+            {
                 p.tags = tags.clone();
             }
             Ok(())
@@ -177,7 +215,11 @@ impl RegistryManager {
     pub fn list_sorted(&self, mode: ListMode) -> Result<Vec<Project>> {
         let reg = self.load()?;
         let mut projects: Vec<Project> = match mode {
-            ListMode::Quick => reg.projects.into_iter().filter(|p| p.status == ProjectStatus::Active).collect(),
+            ListMode::Quick => reg
+                .projects
+                .into_iter()
+                .filter(|p| p.status == ProjectStatus::Active)
+                .collect(),
             ListMode::Favorite => reg.projects.into_iter().filter(|p| p.favorite).collect(),
             ListMode::All => reg.projects,
         };
@@ -193,9 +235,14 @@ impl RegistryManager {
     // --- Backup ---
 
     fn backup(&self) -> Result<()> {
-        if !self.exists() { return Ok(()); }
-        let backup_dir = self.path.parent()
-            .ok_or_else(|| anyhow::anyhow!("registry path has no parent"))?.join(".backups");
+        if !self.exists() {
+            return Ok(());
+        }
+        let backup_dir = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("registry path has no parent"))?
+            .join(".backups");
         fs::create_dir_all(&backup_dir)?;
         let ts = Utc::now().timestamp();
         fs::copy(&self.path, backup_dir.join(format!("registry.{ts}.backup")))?;
@@ -235,7 +282,8 @@ mod tests {
     #[test]
     fn test_add_and_get() {
         let (_dir, mgr) = setup();
-        mgr.add("test-proj", "Test Project", "A test", "Research").unwrap();
+        mgr.add("test-proj", "Test Project", "A test", "Research")
+            .unwrap();
         let proj = mgr.get("test-proj").unwrap().unwrap();
         assert_eq!(proj.display_name, "Test Project");
         assert_eq!(proj.status, ProjectStatus::Active);

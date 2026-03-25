@@ -1,8 +1,8 @@
 [package]
 name = "cpm"
-version = "3.1.0"
+version = "3.3.0"
 edition = "2021"
-description = "Claude Project Manager — Rust TUI for managing Claude Code projects"
+description = "Projectwise — Rust TUI project manager for Claude Code"
 license = "MIT"
 repository = "https://github.com/anoop-titus/Projectwise"
 

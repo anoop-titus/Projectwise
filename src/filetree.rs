@@ -1,6 +1,6 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, BorderType, List, ListItem, ListState},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState},
 };
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,7 @@ impl TreeNode {
             path: path.to_path_buf(),
             depth,
             is_dir,
-            expanded: false,
+            expanded: depth < 3,
             children: Vec::new(),
         };
         if is_dir && depth < MAX_DEPTH {
@@ -166,9 +166,9 @@ pub fn render_tree(
     use crate::theme;
 
     let border_style = if focused {
-        Style::default().fg(theme::ACCENT)
+        Style::default().fg(theme::accent())
     } else {
-        Style::default().fg(theme::BORDER)
+        Style::default().fg(theme::border_color())
     };
 
     let block = Block::default()
@@ -195,17 +195,21 @@ pub fn render_tree(
         .map(|(i, (depth, name, is_dir, expanded, _path))| {
             let indent = "  ".repeat(*depth);
             let icon = if *is_dir {
-                if *expanded { "▼ " } else { "▶ " }
+                if *expanded {
+                    "▼ "
+                } else {
+                    "▶ "
+                }
             } else {
                 "  "
             };
             let text = format!("{indent}{icon}{name}");
             let style = if i == state.selected {
-                Style::default().bg(theme::ACCENT).fg(theme::BG)
+                Style::default().bg(theme::accent()).fg(theme::bg())
             } else if *is_dir {
-                Style::default().fg(theme::ACCENT)
+                Style::default().fg(theme::accent())
             } else {
-                Style::default().fg(theme::FG)
+                Style::default().fg(theme::fg())
             };
             ListItem::new(text).style(style)
         })

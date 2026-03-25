@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveDateTime, Utc, Datelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -118,7 +118,7 @@ pub fn last_n_days(n: u64) -> Result<Vec<u64>> {
         if date >= today - chrono::Duration::days(n as i64 - 1) && date <= today {
             let diff = today - date;
             let index = diff.num_days() as usize; // 0 = today, n-1 = n days ago
-            // We want oldest first, so reverse: index_from_start = n - 1 - index
+                                                  // We want oldest first, so reverse: index_from_start = n - 1 - index
             let rev_index = (n as usize - 1) - index;
             if rev_index < counts.len() {
                 counts[rev_index] += 1;
