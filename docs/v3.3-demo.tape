@@ -12,10 +12,19 @@ Set PlaybackSpeed 0.7
 
 Output docs/v3.3-demo.gif
 
-# --- Scene 1: Version ---
-Type "export CLAUDE_PROJECTS_DIR=/tmp/cpm-demo-projects && export PATH=$HOME/.local/bin:$PATH"
+# --- Setup: export PATH and demo registry ---
+Hide
+Type "export PATH=/home/typhoon/.local/bin:$PATH"
+Enter
+Type "export CLAUDE_PROJECTS_DIR=/tmp/cpm-demo-projects"
 Enter
 Sleep 0.5s
+Type "clear"
+Enter
+Sleep 0.5s
+Show
+
+# --- Scene 1: Version ---
 Type "cpm version"
 Enter
 Sleep 2s
