@@ -102,6 +102,12 @@ impl std::str::FromStr for ListMode {
     }
 }
 
-fn default_description() -> String { "Project".to_string() }
-fn default_category() -> String { "Research".to_string() }
-fn default_status() -> ProjectStatus { ProjectStatus::Active }
+fn default_description() -> String {
+    "Project".to_string()
+}
+fn default_category() -> String {
+    "Research".to_string()
+}
+fn default_status() -> ProjectStatus {
+    ProjectStatus::Active
+}

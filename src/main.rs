@@ -197,6 +197,9 @@ enum RegistrySub {
         folder: String,
         tags: String,
     },
+    /// Auto-detect categories for all projects based on directory contents
+    #[command(name = "auto-categorize")]
+    AutoCategorize,
 }
 
 #[derive(Subcommand)]
@@ -710,9 +713,9 @@ fn run_list_ui<W: std::io::Write>(
 
             // Footer
             let footer_text = if show_tree {
-                " q:Quit  j/k:\u{2191}\u{2193}  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  x:Delete  r:Rename  Enter:Open"
+                " q:Quit  j/k:\u{2191}\u{2193}  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
             } else {
-                " q:Quit  j/k:\u{2191}\u{2193}  d:Dashboard  t:Theme  x:Delete  r:Rename  Enter:Open"
+                " q:Quit  j/k:\u{2191}\u{2193}  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
             };
             let footer_idx = if show_tree { vertical_chunks.len() - 1 } else { 2 };
             let footer = Paragraph::new(footer_text).style(theme::dim());
@@ -869,14 +872,20 @@ fn run_list_ui<W: std::io::Write>(
                             }
                         }
                         KeyCode::Char('c') => {
-                            // Category picker shortcut
+                            // Category picker shortcut with auto-detection
                             if focus == FocusPanel::Table
                                 && selected >= virtual_count
                                 && selected - virtual_count < projects.len()
                             {
-                                let cats = collect_categories(&projects);
+                                let ri = selected - virtual_count;
+                                let project_dir = projects.get(ri)
+                                    .map(|p| home.join(&p.folder_name));
+                                let cats = collect_categories_with_detection(
+                                    &projects,
+                                    project_dir.as_deref(),
+                                );
                                 overlay = Overlay::CategoryPicker {
-                                    row: selected - virtual_count,
+                                    row: ri,
                                     options: cats,
                                     selected: 0,
                                 };
@@ -945,7 +954,12 @@ fn run_list_ui<W: std::io::Write>(
                                         } else if col_in_table >= cat_col_start
                                             && col_in_table < cat_col_end
                                         {
-                                            let cats = collect_categories(&projects);
+                                            let project_dir = projects.get(ri)
+                                                .map(|p| home.join(&p.folder_name));
+                                            let cats = collect_categories_with_detection(
+                                                &projects,
+                                                project_dir.as_deref(),
+                                            );
                                             overlay = Overlay::CategoryPicker {
                                                 row: ri,
                                                 options: cats,
@@ -1041,10 +1055,90 @@ fn update_tree_for_selection(
         .map(|dir| filetree::FileTreeState::new(&dir));
 }
 
-fn collect_categories(projects: &[models::Project]) -> Vec<String> {
+/// Detect project category by scanning directory contents for signature files.
+fn detect_category(dir: &std::path::Path) -> Option<String> {
+    if !dir.exists() {
+        return None;
+    }
+
+    // Check for signature files (ordered by specificity)
+    let signatures: &[(&[&str], &str)] = &[
+        (&["Cargo.toml"], "Rust"),
+        (&["go.mod"], "Go"),
+        (&["Package.swift", "*.xcodeproj"], "Swift"),
+        (&["pubspec.yaml"], "Flutter"),
+        (&["mix.exs"], "Elixir"),
+        (&["Gemfile", "*.gemspec"], "Ruby"),
+        (&["pom.xml", "build.gradle", "build.gradle.kts"], "Java"),
+        (&["*.csproj", "*.sln"], "C#/.NET"),
+        (&["CMakeLists.txt", "Makefile.am"], "C/C++"),
+        (&["pyproject.toml", "setup.py", "requirements.txt", "Pipfile"], "Python"),
+        (&["package.json"], "Node"),
+        (&["composer.json"], "PHP"),
+        (&["Dockerfile", "docker-compose.yml", "docker-compose.yaml"], "DevOps"),
+        (&["terraform.tf", "main.tf", "*.tfvars"], "Terraform"),
+        (&["ansible.cfg", "playbook.yml"], "Ansible"),
+        (&[".claude", "CLAUDE.md"], "Claude Code"),
+        (&["Makefile"], "Build System"),
+    ];
+
+    let entries: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    for (patterns, category) in signatures {
+        for pattern in *patterns {
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                // Glob suffix match
+                if entries.iter().any(|e| e.ends_with(suffix)) {
+                    return Some(category.to_string());
+                }
+            } else if entries.iter().any(|e| e == *pattern) {
+                return Some(category.to_string());
+            }
+        }
+    }
+
+    // Fallback: check for common project structure hints
+    if entries.iter().any(|e| e == "src" || e == "lib") {
+        return Some("Software".to_string());
+    }
+    if entries.iter().any(|e| e == "docs" || e == "content" || e.ends_with(".md")) {
+        return Some("Documentation".to_string());
+    }
+
+    None
+}
+
+/// Build category options for the picker overlay, including auto-detected suggestion.
+fn collect_categories_with_detection(
+    projects: &[models::Project],
+    project_dir: Option<&std::path::Path>,
+) -> Vec<String> {
     let mut cats: Vec<String> = projects.iter().map(|p| p.category.clone()).collect();
+
+    // Add standard categories that might not be in any project yet
+    let standard = [
+        "Research", "Software", "DevOps", "Documentation", "Experiment", "Archive",
+    ];
+    for s in standard {
+        cats.push(s.to_string());
+    }
+
     cats.sort();
     cats.dedup();
+
+    // If we can detect a category, move it to the top
+    if let Some(dir) = project_dir {
+        if let Some(detected) = detect_category(dir) {
+            // Remove it from its current position if present, and insert at top
+            cats.retain(|c| c != &detected);
+            cats.insert(0, format!("{detected} (detected)"));
+        }
+    }
+
     cats.push("Custom...".to_string());
     cats
 }
@@ -1318,8 +1412,13 @@ fn handle_overlay_event(
                         };
                         return OverlayAction::Consumed;
                     }
+                    // Strip " (detected)" suffix if present
+                    let category = chosen
+                        .strip_suffix(" (detected)")
+                        .unwrap_or(&chosen)
+                        .to_string();
                     if let Some(p) = projects.get(row_val) {
-                        let _ = mgr.set_field(&p.folder_name, "category", &chosen);
+                        let _ = mgr.set_field(&p.folder_name, "category", &category);
                         reload_projects(projects, sizes, mgr, home, mode);
                     }
                     OverlayAction::Close
@@ -1946,6 +2045,40 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
         RegistrySub::SetTags { folder, tags } => {
             let tags: Vec<String> = tags.split(',').map(|s| s.trim().to_string()).collect();
             mgr.set_tags(&folder, tags)?;
+        }
+        RegistrySub::AutoCategorize => {
+            use colored::*;
+            let home = get_home();
+            let projects = mgr.list_sorted(ListMode::All)?;
+            let mut updated = 0usize;
+            for p in &projects {
+                let dir = home.join(&p.folder_name);
+                if let Some(detected) = detect_category(&dir) {
+                    if p.category == "Research" || p.category == "Project" {
+                        mgr.set_field(&p.folder_name, "category", &detected)?;
+                        eprintln!(
+                            "  {} {} -> {}",
+                            "\u{2713}".green(),
+                            truncate_display(&p.display_name, 30),
+                            detected.cyan()
+                        );
+                        updated += 1;
+                    } else {
+                        eprintln!(
+                            "  {} {} (kept: {}, detected: {})",
+                            "\u{2014}".dimmed(),
+                            truncate_display(&p.display_name, 30),
+                            p.category.yellow(),
+                            detected.dimmed()
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "\n{} Updated {updated}/{} projects",
+                "\u{2713}".green(),
+                projects.len()
+            );
         }
     }
     Ok(())
