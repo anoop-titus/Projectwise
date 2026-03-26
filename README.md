@@ -4,7 +4,7 @@
 
 **One 1.3 MB binary. Zero config. Every project at your fingertips.**
 
-[![Version](https://img.shields.io/badge/version-3.1.0-blue?style=flat-square)](package/VERSION)
+[![Version](https://img.shields.io/badge/version-3.3.0-blue?style=flat-square)](package/VERSION)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange?style=flat-square)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](package/LICENSE)
 [![Tests](https://img.shields.io/badge/tests-7%20passing-brightgreen?style=flat-square)](#testing)
@@ -18,9 +18,9 @@ interactive project manager for Claude Code workspaces.
 
 <div align="center">
 
-![Projectwise Workflow](docs/workflow.gif)
+![Projectwise TUI](docs/v3.3-demo.gif)
 
-*Type `claude` → pick a project → axon + tldr refresh → you're coding.*
+*40 opaline themes. Mouse support. Dashboard with heatmap. Pick a project and code.*
 
 </div>
 
@@ -40,7 +40,22 @@ Projectwise solves all of it:
 | Stale code intelligence | Auto-refreshes Axon graphs + tldr indexes on every entry |
 | Corrupted project registry | Atomic writes via tempfile + POSIX rename, with file locking |
 | Phantom deleted directories | Integrity checker detects and repairs mismatches |
+| No visual overview of activity | Dashboard with 52-week heatmap, bar charts, and sparkline |
 | 700 lines of fragile shell | Single 1.3 MB Rust binary, 0 compiler warnings |
+
+---
+
+## Features (v3.3.0)
+
+- **40 opaline themes** with live switching (`t` key cycles themes in-TUI)
+- **Mouse support** -- click to select projects, scroll wheel to navigate
+- **Interactive overlays** -- status picker, category dropdown with custom input
+- **TUI rename & delete** -- `r` to rename, `x`/`Del` to delete with confirmation dialog
+- **3-panel layout** -- project list + directory tree + info panel
+- **Dashboard** -- 52-week activity heatmap, bar charts, sparkline
+- **Shell commands** -- `clauded` and `projectwise` functions via `eval "$(cpm shell-init)"`
+- **Atomic registry** -- tempfile + POSIX rename, backup rotation, file locking
+- **Background code intelligence** -- Axon + tldr refresh on project entry, never blocks
 
 ---
 
@@ -59,6 +74,8 @@ Add to your `.zshrc` or `.bashrc`:
 eval "$(cpm shell-init)"
 ```
 
+This emits shell functions including `projectwise` and `clauded` -- thin wrappers that call the binary and `cd` the parent shell (same pattern as [zoxide](https://github.com/ajeetdsouza/zoxide)).
+
 Initialize the registry:
 
 ```bash
@@ -74,22 +91,33 @@ cpm registry init
 ### Select & Enter a Project
 
 ```bash
-claude              # FZF picker → enters Claude Code in the selected project
-cpm select          # just the picker (returns folder name)
-cpm select all      # include archived projects
+projectwise          # TUI picker → enters Claude Code in the selected project
+clauded              # alias — same behavior
+cpm select           # FZF picker (returns folder name)
+cpm select all       # include archived projects
 ```
-
-The `claude` shell wrapper uses the same pattern as [zoxide](https://github.com/ajeetdsouza/zoxide) -- a thin shell function that calls the binary and `cd`s the parent shell.
 
 ### Interactive Project Table
 
 ```bash
-cpm list              # Ratatui TUI with dark theme, alternating rows
+cpm list              # Ratatui TUI: 3-panel layout, opaline theme
 cpm list favorite     # favorites only
 cpm list all          # including archived
 ```
 
-Navigate with `j`/`k` or arrow keys. `Enter` for details. `q` to quit.
+**TUI keybindings:**
+
+| Key | Action |
+|-----|--------|
+| `j`/`k` or arrows | Navigate project list |
+| `Enter` | Select and enter project |
+| `t` | Cycle through 40 opaline themes |
+| `r` | Rename project (inline) |
+| `x` / `Del` | Delete project (with confirmation) |
+| `d` | Open dashboard (heatmap, charts, sparkline) |
+| Mouse click | Select project |
+| Scroll wheel | Navigate list |
+| `q` / `Esc` | Quit |
 
 ### Manage Projects
 
@@ -124,7 +152,7 @@ cpm registry set-tags <folder> <csv>   # comma-separated tags
 ### Integrity & Cleanup
 
 ```bash
-cpm integrity check               # show registry ↔ filesystem mismatches
+cpm integrity check               # show registry <-> filesystem mismatches
 cpm integrity repair               # auto-fix: archive missing, add untracked
 
 cpm cleanup prune --days 30        # remove stale .axon/.tldr caches
@@ -146,15 +174,15 @@ cpm cleanup report                 # per-project size breakdown
 ## How It Works
 
 ```
-eval "$(cpm shell-init)"     # emits a ~25-line claude() shell wrapper
-        │
-        ▼
+eval "$(cpm shell-init)"     # emits projectwise() + clauded() shell wrappers
+        |
+        v
     cpm select               # FZF picker with themed preview
-        │
-        ▼
+        |
+        v
     cpm pre-launch <folder>  # background: axon analyze + tldr warm
-        │                    #   + registry touch + doc review prompt
-        ▼
+        |                    #   + registry touch + doc review prompt
+        v
     command claude "$@"      # enters Claude Code in the project dir
 ```
 
@@ -178,8 +206,8 @@ eval "$(cpm shell-init)"     # emits a ~25-line claude() shell wrapper
 src/
 ├── main.rs       # clap CLI dispatcher + all command implementations
 ├── models.rs     # Project, Registry, ProjectStatus, ListMode structs
-├── registry.rs   # CRUD, atomic writes (tempfile → rename), backup rotation
-└── theme.rs      # Ratatui dark theme: cyan / green / amber / gold
+├── registry.rs   # CRUD, atomic writes (tempfile -> rename), backup rotation
+└── theme.rs      # 40 opaline themes with live switching
 ```
 
 **Design decisions worth noting:**
@@ -188,6 +216,7 @@ src/
 - **Atomic writes** -- every registry mutation writes to a tempfile in the same directory, then calls `fs::rename` (POSIX atomic). No partial writes, ever.
 - **Backup rotation** -- the last 10 timestamped registry snapshots live in `.backups/`.
 - **Graceful degradation** -- `cmd_exists()` checks before spawning axon, tldr, or claude-context. Missing tools are silently skipped.
+- **Opaline theme engine** -- 40 named themes stored as palette structs, cycled live with zero restart.
 
 ---
 
@@ -200,6 +229,10 @@ cargo test    # 7 unit tests: registry CRUD, sorting, favorites, set_field
 ---
 
 ## Changelog
+
+### v3.3.0
+
+40 opaline themes with live switching (`t`). Mouse support (click, scroll). Interactive overlays for status and category. TUI rename (`r`) and delete (`x`/`Del`) with confirmation. 3-panel layout: project list + directory tree + info panel. Dashboard with 52-week heatmap, bar charts, sparkline. `clauded` and `projectwise` shell commands via `cpm shell-init`.
 
 ### v3.1.0
 
