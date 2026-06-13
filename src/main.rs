@@ -6,6 +6,7 @@ mod theme;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use models::ListMode;
@@ -70,7 +71,7 @@ fn get_home() -> PathBuf {
 #[derive(Parser)]
 #[command(
     name = "cpm",
-    version = "3.3.0",
+    version = "3.4.0",
     about = "Projectwise — TUI project manager for Claude Code"
 )]
 struct Cli {
@@ -228,7 +229,7 @@ fn main() -> Result<()> {
         Some(Commands::Registry { sub }) => cmd_registry(&mgr, sub),
         Some(Commands::ShellInit) => cmd_shell_init(),
         Some(Commands::Version) => {
-            println!("Projectwise v3.3.0");
+            println!("Projectwise v3.4.0");
             Ok(())
         }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
@@ -376,6 +377,59 @@ pub fn human_size(bytes: u64) -> String {
     format_size(bytes)
 }
 
+/// Load average progress % and repoPath per project from ~/.claude/progress/tasks.json.
+/// Key matches CPM project id (e.g. "Swapfest_1779110431").
+/// Returns (avg_pct 0-100, repo_path).
+fn load_progress_data(home: &std::path::Path) -> HashMap<String, (u8, Option<String>)> {
+    let tasks_path = match home.parent() {
+        Some(claude_dir) => claude_dir.join("progress/tasks.json"),
+        None => return HashMap::new(),
+    };
+    let content = match std::fs::read_to_string(&tasks_path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let projects = match json["projects"].as_object() {
+        Some(p) => p,
+        None => return HashMap::new(),
+    };
+    projects
+        .iter()
+        .filter_map(|(key, val)| {
+            let tasks = val["tasks"].as_array()?;
+            if tasks.is_empty() {
+                return None;
+            }
+            let sum: f64 = tasks
+                .iter()
+                .filter_map(|t| t["progressPct"].as_f64())
+                .sum();
+            let pct = (sum / tasks.len() as f64).round() as u8;
+            let repo_path = val["repoPath"].as_str().map(String::from);
+            Some((key.clone(), (pct, repo_path)))
+        })
+        .collect()
+}
+
+/// Produce a compact display string for a PROGRESS.html URL.
+/// Shows "✓ ~/short/path/PROGRESS.html" or "— " if unavailable.
+fn progress_url_cell(repo_path: &str) -> String {
+    let html = std::path::Path::new(repo_path).join("PROGRESS.html");
+    let exists = html.exists();
+    let short = dirs::home_dir()
+        .and_then(|h| {
+            let hs = h.to_string_lossy().into_owned();
+            repo_path.strip_prefix(&hs).map(|rest| format!("~{rest}"))
+        })
+        .unwrap_or_else(|| repo_path.to_string());
+    let indicator = if exists { "\u{2713}" } else { "\u{00b7}" };
+    format!("{indicator} {short}/PROGRESS.html")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FocusPanel {
     Table,
@@ -438,6 +492,9 @@ fn run_list_ui<W: std::io::Write>(
 ) -> Result<Option<String>> {
     use crossterm::event::{self, Event, KeyCode, MouseButton, MouseEventKind};
     use ratatui::{prelude::*, widgets::*};
+
+    // Load progress data from tasks.json once at startup
+    let progress_data = load_progress_data(home);
 
     // Virtual rows: 2 items at top (Quick Session, New Project)
     let virtual_count: usize = if select_mode { 2 } else { 0 };
@@ -524,7 +581,7 @@ fn run_list_ui<W: std::io::Write>(
                 theme::border()
             };
 
-            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Size"]
+            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Size", "Progress", "URL"]
                 .iter()
                 .map(|h| Cell::from(*h).style(theme::header()));
             let header = Row::new(header_cells).height(1);
@@ -546,6 +603,8 @@ fn run_list_ui<W: std::io::Write>(
                     Cell::from("").style(qs_style),
                     Cell::from("").style(qs_style),
                     Cell::from("").style(qs_style),
+                    Cell::from("").style(qs_style),
+                    Cell::from("").style(qs_style),
                 ]));
 
                 // New Project virtual row
@@ -557,6 +616,8 @@ fn run_list_ui<W: std::io::Write>(
                 rows.push(Row::new(vec![
                     Cell::from("\u{2795}").style(np_style),
                     Cell::from("New Project").style(np_style),
+                    Cell::from("").style(np_style),
+                    Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
@@ -573,6 +634,24 @@ fn run_list_ui<W: std::io::Write>(
 
                 let base = if row_idx.is_multiple_of(2) { theme::row_normal() } else { theme::row_alt() };
 
+                let (prog_cell, prog_style, url_text) = match progress_data.get(&p.id) {
+                    Some((pct, repo)) => {
+                        let pct_str = format!("{:>3}%", pct);
+                        let pstyle = if *pct >= 80 {
+                            Style::default().fg(ratatui::style::Color::Green)
+                        } else if *pct >= 40 {
+                            Style::default().fg(ratatui::style::Color::Yellow)
+                        } else {
+                            Style::default().fg(ratatui::style::Color::Red)
+                        };
+                        let url = repo.as_deref()
+                            .map(progress_url_cell)
+                            .unwrap_or_else(|| "\u{2014}".to_string());
+                        (pct_str, pstyle, url)
+                    }
+                    None => ("\u{2014}   ".to_string(), theme::dim(), "\u{2014}".to_string()),
+                };
+
                 rows.push(Row::new(vec![
                     Cell::from(fav).style(theme::favorite()),
                     Cell::from(name).style(base),
@@ -580,6 +659,8 @@ fn run_list_ui<W: std::io::Write>(
                     Cell::from(status_str.clone()).style(theme::status_style(&status_str)),
                     Cell::from(format!("{:>4}", p.session_count)).style(base),
                     Cell::from(size_str).style(theme::dim()),
+                    Cell::from(prog_cell).style(prog_style),
+                    Cell::from(truncate_display(&url_text, 45)).style(theme::dim()),
                 ]));
             }
 
@@ -590,6 +671,8 @@ fn run_list_ui<W: std::io::Write>(
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Min(10),
             ];
 
             let table = Table::new(rows, widths)
@@ -664,6 +747,16 @@ fn run_list_ui<W: std::io::Write>(
                         let tags_str = if p.tags.is_empty() { "\u{2014}".to_string() } else { p.tags.join(", ") };
                         let git_str = p.git_link.as_deref().unwrap_or("\u{2014}");
                         let last_str = relative_time(&p.last_accessed);
+                        let (prog_info, url_info) = match progress_data.get(&p.id) {
+                            Some((pct, repo)) => {
+                                let ps = format!("{}%", pct);
+                                let u = repo.as_deref()
+                                    .map(|r| format!("file://{}/PROGRESS.html", r))
+                                    .unwrap_or_else(|| "\u{2014}".to_string());
+                                (ps, u)
+                            }
+                            None => ("\u{2014}".to_string(), "\u{2014}".to_string()),
+                        };
                         vec![
                             Line::from(vec![
                                 Span::styled("Desc:     ", theme::dim()),
@@ -676,6 +769,14 @@ fn run_list_ui<W: std::io::Write>(
                             Line::from(vec![
                                 Span::styled("Git:      ", theme::dim()),
                                 Span::styled(truncate_display(git_str, 30), theme::dim()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Progress: ", theme::dim()),
+                                Span::styled(prog_info, theme::row_normal()),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("URL:      ", theme::dim()),
+                                Span::styled(truncate_display(&url_info, 35), theme::dim()),
                             ]),
                             Line::from(vec![
                                 Span::styled("Created:  ", theme::dim()),
@@ -2091,7 +2192,7 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 fn cmd_shell_init() -> Result<()> {
     print!(
         r#"# Projectwise — shell integration
-# Generated by cpm shell-init v3.3.0
+# Generated by cpm shell-init v3.4.0
 projectwise() {{
   command -v claude &>/dev/null || {{ echo "Error: claude CLI not found" >&2; return 127; }}
   local _pd="${{CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}}"
