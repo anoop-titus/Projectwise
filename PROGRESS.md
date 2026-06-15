@@ -11,6 +11,7 @@ Code-architecture-reviewer pass + full E2E/unit sweep ahead of PROD.
 - **E2E (19 checks):** version, shell-init surface, registry/integrity/cleanup, rules-sync idempotency+cleanliness, mirror invariants (20 masters=20 symlinks, 0 broken, rules/ .toon-only), md→toon round-trip, context digest, path-traversal safety (info validated; preview is registry-only/safe), no-panic on bad input — all green.
 
 **Status:** build clean, clippy 0, 18/18 tests, E2E green. Installed `~/.local/bin/cpm` v3.7.1.
+**Shipped:** PR #1 merged to `main` as `7c9abe2`, tagged `v3.7.1`, 2026-06-14. README/CI/.gitignore included; manual TUI smoke test passed by user.
 
 ## v3.7.0 — 2026-06-14 — Readable .md rule mirror + .toon round-trip
 

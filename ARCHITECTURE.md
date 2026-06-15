@@ -198,6 +198,4 @@ flowchart TD
 
 ## Change Log
 
-- 2026-06-14 · uncommitted v3.7.0 · readable .md rule mirror (~/.claude/rules-md) + .toon round-trip via md_to_json|toon; rules/ now strictly .toon-only; added cpm rules-sync.
-- 2026-06-14 · uncommitted v3.6.0 · added CLAUDE.md + RULES tabs (readable view + edit with TOON round-trip via Tokenizer manifest/backup) and session interview prompt.
-- 2026-06-14 · uncommitted v3.5.0 · added Tokenizer tab, in-TUI fzf search, and context-digest auto-injection pipeline.
+- 2026-06-14 · commit `90505fa` · tag v3.7.1 — merged PR #1: tabbed cockpit (Tokenizer/CLAUDE.md/RULES tabs), context-digest generator, rule .md↔.toon round-trip, rules/ now .toon-only, cpm rules-sync bootstrap, PROD hardening.
