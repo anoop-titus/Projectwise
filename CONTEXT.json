@@ -1,0 +1,18 @@
+{
+  "task": "Projectwise v3.7.0 — readable .md rule mirror (~/.claude/rules-md) with .toon round-trip; rules/ becomes strictly .toon-only; cpm rules-sync bootstrap",
+  "files": [
+    "src/main.rs",
+    "Cargo.toml",
+    "PROGRESS.md",
+    "~/.claude/rules-md/ (created)",
+    "~/.claude/rules/ (now .toon-only)"
+  ],
+  "decisions": [
+    "Mirror at ~/.claude/rules-md/ holding readable .md masters + a <stem>.toon symlink to the live rules .toon.",
+    "rules/ made strictly .toon-only (the 4 live .md were compiled and removed); user accepted that Claude Code natively loads .md and .toon-only needs their own loader.",
+    "Reused the user's existing converter pipeline `md_to_json | toon -e -o` (same as their rules-to-toon.sh hook) instead of reimplementing; Projectwise runs it itself because $EDITOR edits don't trigger that hook.",
+    "Safety: .toon written atomically via temp; on converter failure master kept + old .toon preserved; .md removed from rules/ only after non-empty .toon written.",
+    "Edit flow now operates on the persistent master in rules-md (no temp file), recompiling on save."
+  ],
+  "outcome": "Implemented, tested, installed. cargo build --release clean; clippy 0 errors (2 pre-existing); 12/12 tests. rules-sync built 21 masters + 21 symlinks; rules/ now .toon-only; round-trip + idempotency verified. FINDING: 4 rules (aqua-agent, docker-permissions, document-auto-processing, mcp-architecture) were already gone before rules-sync (user's ~21:00 _backups_mcp_cleanup); rules-sync never deletes .toon. aqua-agent recoverable from backups; other 3 have no local backup. Not committed/pushed."
+}

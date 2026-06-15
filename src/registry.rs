@@ -223,7 +223,7 @@ impl RegistryManager {
             ListMode::Favorite => reg.projects.into_iter().filter(|p| p.favorite).collect(),
             ListMode::All => reg.projects,
         };
-        projects.sort_by(|a, b| b.last_accessed.cmp(&a.last_accessed));
+        projects.sort_by_key(|p| std::cmp::Reverse(p.last_accessed));
         Ok(projects)
     }
 

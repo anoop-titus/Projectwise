@@ -9,7 +9,9 @@ use crate::registry::RegistryManager;
 
 /// Returns the path to the Claude directory (~/.claude)
 fn claude_dir() -> PathBuf {
-    dirs::home_dir().unwrap().join(".claude")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude")
 }
 
 /// Returns the path to the sessions log file (~/.claude/sessions.log)
@@ -89,7 +91,7 @@ pub fn top_projects(n: usize) -> Result<Vec<(String, u64)>> {
     }
 
     let mut vec: Vec<(String, u64)> = counts.into_iter().collect();
-    vec.sort_by(|a, b| b.1.cmp(&a.1)); // descending by count
+    vec.sort_by_key(|a| std::cmp::Reverse(a.1)); // descending by count
     vec.truncate(n);
     Ok(vec)
 }
