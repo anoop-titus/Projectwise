@@ -65,13 +65,17 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 fn get_home() -> PathBuf {
     std::env::var("CLAUDE_PROJECTS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/projects"))
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude/projects")
+        })
 }
 
 #[derive(Parser)]
 #[command(
     name = "cpm",
-    version = "3.4.0",
+    version = "3.7.1",
     about = "Projectwise — TUI project manager for Claude Code"
 )]
 struct Cli {
@@ -127,6 +131,10 @@ enum Commands {
     },
     /// Emit shell integration code
     ShellInit,
+    /// Build/refresh the readable .md rule mirror (~/.claude/rules-md) and make
+    /// ~/.claude/rules strictly .toon-only
+    #[command(name = "rules-sync")]
+    RulesSync,
     /// Show version
     Version,
     /// [internal] TSV output for FZF reload
@@ -228,8 +236,13 @@ fn main() -> Result<()> {
         Some(Commands::Info { folder }) => cmd_info(&mgr, &folder),
         Some(Commands::Registry { sub }) => cmd_registry(&mgr, sub),
         Some(Commands::ShellInit) => cmd_shell_init(),
+        Some(Commands::RulesSync) => {
+            let summary = rules_sync()?;
+            println!("{summary}");
+            Ok(())
+        }
         Some(Commands::Version) => {
-            println!("Projectwise v3.4.0");
+            println!("Projectwise v3.7.1");
             Ok(())
         }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
@@ -415,6 +428,145 @@ fn load_progress_data(home: &std::path::Path) -> HashMap<String, (u8, Option<Str
         .collect()
 }
 
+/// Strip HTML to plain text: skips <script>/<style> bodies, drops tags, and
+/// collapses whitespace. Used only as a PROGRESS.html fallback for the digest.
+fn strip_html(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let n = html.len();
+    let mut out = String::with_capacity(n / 2);
+    let mut i = 0;
+    while i < n {
+        if html.as_bytes()[i] == b'<' {
+            let rest = &lower[i..];
+            if rest.starts_with("<script") {
+                match lower[i..].find("</script>") {
+                    Some(end) => {
+                        i += end + "</script>".len();
+                        continue;
+                    }
+                    None => break,
+                }
+            } else if rest.starts_with("<style") {
+                match lower[i..].find("</style>") {
+                    Some(end) => {
+                        i += end + "</style>".len();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            match html[i..].find('>') {
+                Some(end) => {
+                    i += end + 1;
+                    out.push(' ');
+                    continue;
+                }
+                None => break,
+            }
+        } else {
+            // Safety: i < n and i is always on a char boundary (we only advance
+            // by ASCII tag bytes or by ch.len_utf8() below), so next() is Some.
+            match html[i..].chars().next() {
+                Some(ch) => {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                None => break, // unreachable in well-formed input; guards against UB
+            }
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build `<dir>/.projectwise/context-digest.md` from the project's tasks.json
+/// progress data + ARCHITECTURE.md so Claude can absorb the latest status on
+/// launch. Returns the digest path when a non-trivial digest was written.
+fn build_context_digest(
+    home: &std::path::Path,
+    folder: &str,
+    dir: &std::path::Path,
+) -> Option<PathBuf> {
+    let mut out = String::new();
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+    out.push_str(&format!("# Projectwise context digest \u{2014} {folder}\n\n"));
+    out.push_str(&format!(
+        "> Generated {now}. Last-updated PROGRESS + ARCHITECTURE snapshot for this project. Absorb before starting work.\n\n"
+    ));
+
+    let mut has_content = false;
+
+    // Progress from ~/.claude/progress/tasks.json (authoritative source).
+    let task_entry = home
+        .parent()
+        .map(|c| c.join("progress/tasks.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|j| j["projects"][folder].as_object().cloned());
+
+    if let Some(entry) = task_entry {
+        if let Some(tasks) = entry.get("tasks").and_then(|t| t.as_array()) {
+            let total = tasks.len();
+            let avg = if total > 0 {
+                (tasks
+                    .iter()
+                    .filter_map(|t| t["progressPct"].as_f64())
+                    .sum::<f64>()
+                    / total as f64)
+                    .round() as u8
+            } else {
+                0
+            };
+            out.push_str(&format!("## Progress ({total} tasks, {avg}% avg)\n\n"));
+            for t in tasks {
+                let title = t["title"].as_str().unwrap_or("(untitled)");
+                let status = t["status"].as_str().unwrap_or("?");
+                let pct = t["progressPct"].as_f64().unwrap_or(0.0) as u8;
+                out.push_str(&format!("- **{title}** \u{2014} {status}, {pct}%\n"));
+                if let Some(ctx) = t["plan"]["context"].as_str() {
+                    if !ctx.trim().is_empty() {
+                        out.push_str(&format!("  - {}\n", ctx.replace('\n', " ")));
+                    }
+                }
+            }
+            out.push('\n');
+            has_content = true;
+        }
+    }
+
+    // Fallback: PROGRESS.md, then PROGRESS.html stripped to text.
+    if !has_content {
+        if let Ok(md) = std::fs::read_to_string(dir.join("PROGRESS.md")) {
+            out.push_str("## Progress (from PROGRESS.md)\n\n");
+            out.push_str(&truncate_display(&md, 4000));
+            out.push_str("\n\n");
+            has_content = true;
+        } else if let Ok(html) = std::fs::read_to_string(dir.join("PROGRESS.html")) {
+            out.push_str("## Progress (from PROGRESS.html)\n\n");
+            out.push_str(&truncate_display(&strip_html(&html), 4000));
+            out.push_str("\n\n");
+            has_content = true;
+        }
+    }
+
+    // Architecture from ARCHITECTURE.md at the project root.
+    if let Ok(arch) = std::fs::read_to_string(dir.join("ARCHITECTURE.md")) {
+        out.push_str("## Architecture (ARCHITECTURE.md)\n\n");
+        out.push_str(&arch);
+        out.push('\n');
+        has_content = true;
+    }
+
+    if !has_content {
+        return None;
+    }
+
+    let digest_dir = dir.join(".projectwise");
+    std::fs::create_dir_all(&digest_dir).ok()?;
+    let digest_path = digest_dir.join("context-digest.md");
+    std::fs::write(&digest_path, out).ok()?;
+    Some(digest_path)
+}
+
 /// Produce a compact display string for a PROGRESS.html URL.
 /// Shows "✓ ~/short/path/PROGRESS.html" or "— " if unavailable.
 fn progress_url_cell(repo_path: &str) -> String {
@@ -445,6 +597,760 @@ impl FocusPanel {
             FocusPanel::Info => FocusPanel::Table,
         }
     }
+}
+
+// ── Top-level tabs ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Projects,
+    Tokenizer,
+    ClaudeMd,
+    Rules,
+}
+
+impl Tab {
+    fn next(self) -> Self {
+        match self {
+            Tab::Projects => Tab::Tokenizer,
+            Tab::Tokenizer => Tab::ClaudeMd,
+            Tab::ClaudeMd => Tab::Rules,
+            Tab::Rules => Tab::Projects,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            Tab::Projects => Tab::Rules,
+            Tab::Tokenizer => Tab::Projects,
+            Tab::ClaudeMd => Tab::Tokenizer,
+            Tab::Rules => Tab::ClaudeMd,
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Tab::Projects => 0,
+            Tab::Tokenizer => 1,
+            Tab::ClaudeMd => 2,
+            Tab::Rules => 3,
+        }
+    }
+}
+
+// ── Tokenizer integration helpers ───────────────────────────────────
+
+struct TokStatus {
+    bin_exists: bool,
+    timer_installed: bool,
+    hook_installed: bool,
+}
+
+/// Resolve the tokenizer binary path (override with TOKENIZER_BIN).
+fn tokenizer_bin() -> PathBuf {
+    std::env::var("TOKENIZER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".cargo/bin/tokenizer")
+        })
+}
+
+/// Read-only inspection of Tokenizer's install state (matches the paths
+/// Tokenizer's daemon.rs writes to).
+fn tok_status() -> TokStatus {
+    let home = dirs::home_dir().unwrap_or_default();
+    let timer = {
+        #[cfg(target_os = "macos")]
+        {
+            home.join("Library/LaunchAgents/com.tokenizer.plist")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            home.join(".config/systemd/user/tokenizer.timer")
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            home.join(".config/tokenizer/.timer-installed")
+        }
+    };
+    let hook = {
+        #[cfg(windows)]
+        {
+            home.join(".claude/hooks/tokenizer-post-session.ps1")
+        }
+        #[cfg(not(windows))]
+        {
+            home.join(".claude/hooks/tokenizer-post-session.sh")
+        }
+    };
+    TokStatus {
+        bin_exists: tokenizer_bin().exists() || cmd_exists("tokenizer"),
+        timer_installed: timer.exists(),
+        hook_installed: hook.exists(),
+    }
+}
+
+/// Fire a background `tokenizer optimize --quiet` (non-blocking, fail-open).
+fn spawn_tokenizer_optimize() {
+    let bin = tokenizer_bin();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new(&bin)
+            .args(["optimize", "--quiet"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    });
+}
+
+/// Run a tokenizer subcommand in the foreground (used after suspending the TUI).
+fn run_tokenizer_cmd(args: &[&str]) -> Result<()> {
+    let _ = std::process::Command::new(tokenizer_bin())
+        .args(args)
+        .status();
+    Ok(())
+}
+
+/// Render the Tokenizer status tab into `area`.
+fn render_tokenizer_tab(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st: &TokStatus) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
+    let mark = |b: bool| if b { "\u{2713}" } else { "\u{00b7}" };
+    let state = |b: bool, on: &str, off: &str| format!("{} {}", mark(b), if b { on } else { off });
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Tokenizer \u{2014} Claude context optimizer (.md/.json \u{2192} .toon)",
+            theme::title(),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Binary:        ", theme::dim()),
+            Span::styled(
+                state(st.bin_exists, "installed", "missing (cargo install --path ~/Tokenizer)"),
+                theme::row_normal(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Launch timer:  ", theme::dim()),
+            Span::styled(state(st.timer_installed, "installed (hourly)", "not installed"), theme::row_normal()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Session hook:  ", theme::dim()),
+            Span::styled(state(st.hook_installed, "installed", "not installed"), theme::row_normal()),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Actions", theme::header())]),
+        Line::from(vec![
+            Span::styled("    o  ", Style::default().fg(theme::accent())),
+            Span::styled("run optimize now (background)", theme::dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("    T  ", Style::default().fg(theme::accent())),
+            Span::styled("open the full Tokenizer TUI", theme::dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("    i  ", Style::default().fg(theme::accent())),
+            Span::styled("install hourly launch timer", theme::dim()),
+        ]),
+        Line::from(vec![
+            Span::styled("    h  ", Style::default().fg(theme::accent())),
+            Span::styled("install post-session hook", theme::dim()),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Tokenizer is launched + boosted automatically each time you summon Projectwise.",
+            theme::dim(),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Switch tabs with [ and ].",
+            theme::dim(),
+        )]),
+    ];
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border())
+            .title(" Tokenizer ")
+            .title_style(theme::title()),
+    );
+    f.render_widget(p, area);
+}
+
+/// Suspend the Ratatui alternate screen so an external program (fzf, tokenizer
+/// TUI) can own the terminal.
+fn suspend_tui<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+) -> Result<()> {
+    use crossterm::event::DisableMouseCapture;
+    use crossterm::{
+        execute,
+        terminal::{disable_raw_mode, LeaveAlternateScreen},
+    };
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    Ok(())
+}
+
+/// Restore the Ratatui alternate screen after `suspend_tui`.
+fn resume_tui<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+) -> Result<()> {
+    use crossterm::event::EnableMouseCapture;
+    use crossterm::{
+        execute,
+        terminal::{enable_raw_mode, EnterAlternateScreen},
+    };
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Suspend the TUI, run fzf over the folder names directly under
+/// `~/.claude/projects` (the `home` dir), restore the TUI, and return the
+/// chosen folder name (if any). Scope is intentionally limited to project
+/// folder names on disk.
+fn run_project_search<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    home: &std::path::Path,
+) -> Result<Option<String>> {
+    let mut names: Vec<String> = Vec::new();
+    if home.exists() {
+        for entry in std::fs::read_dir(home)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let n = entry.file_name().to_string_lossy().to_string();
+                if !n.starts_with('.') {
+                    names.push(n);
+                }
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        return Ok(None);
+    }
+
+    suspend_tui(terminal)?;
+    let input = names.join("\n");
+    let output = std::process::Command::new("fzf")
+        .args([
+            "--prompt",
+            "Search projects > ",
+            "--height",
+            "100%",
+            "--color",
+            "bg+:#1c1c28,fg+:#00d2d2,hl:#50dc78,hl+:#50dc78,pointer:#00d2d2,prompt:#00d2d2,header:#3c3c50,border:#3c3c50",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+            child.wait_with_output()
+        });
+    resume_tui(terminal)?;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let sel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sel.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(sel))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+// ── CLAUDE.md + RULES tab helpers ────────────────────────────────────
+
+/// Whether a rule's on-disk canonical form is a readable `.md` or a Tokenizer
+/// `.toon` (which must be reconverted on save).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RuleFormat {
+    Md,
+    Toon,
+}
+
+fn claude_md_global_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".claude/CLAUDE.md")
+}
+
+fn claude_md_project_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join("CLAUDE.md")
+}
+
+fn rules_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".claude/rules")
+}
+
+/// Readable `.md` master mirror of the rules (edited here; compiled to .toon).
+fn rules_md_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".claude/rules-md")
+}
+
+/// Resolve the `md_to_json` binary (env MD_TO_JSON_BIN → known path → PATH).
+fn md_to_json_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("MD_TO_JSON_BIN") {
+        return PathBuf::from(p);
+    }
+    let known = dirs::home_dir().unwrap_or_default().join(".local/bin/md_to_json");
+    if known.exists() {
+        return known;
+    }
+    PathBuf::from("md_to_json")
+}
+
+/// Resolve the `toon` CLI (env TOON_BIN → PATH → newest nvm install).
+fn toon_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("TOON_BIN") {
+        return PathBuf::from(p);
+    }
+    if cmd_exists("toon") {
+        return PathBuf::from("toon");
+    }
+    // Fall back to the newest ~/.nvm/.../bin/toon we can find.
+    let nvm = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nvm/versions/node");
+    if let Ok(rd) = std::fs::read_dir(&nvm) {
+        let mut versions: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path().join("bin/toon"))
+            .filter(|p| p.exists())
+            .collect();
+        versions.sort();
+        if let Some(p) = versions.pop() {
+            return p;
+        }
+    }
+    PathBuf::from("toon")
+}
+
+/// Compile a readable `.md` master into a `.toon` via `md_to_json | toon -e -o`
+/// (the same pipeline the user's rules-to-toon hook uses). Errors if either tool
+/// fails or produces an empty file, so callers can preserve the previous `.toon`.
+fn md_to_toon(md_path: &std::path::Path, toon_path: &std::path::Path) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let json = Command::new(md_to_json_bin())
+        .arg(md_path)
+        .stderr(Stdio::null())
+        .output()
+        .context("running md_to_json")?;
+    if !json.status.success() || json.stdout.is_empty() {
+        anyhow::bail!("md_to_json failed or produced no output");
+    }
+    // Convert to a temp file first, then atomically replace, so a failure never
+    // truncates the live .toon.
+    let tmp = toon_path.with_extension("toon.tmp");
+    let mut child = Command::new(toon_bin())
+        .args(["-e", "-o"])
+        .arg(&tmp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning toon")?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .context("toon stdin")?
+            .write_all(&json.stdout)?;
+    }
+    let status = child.wait().context("waiting for toon")?;
+    let ok = status.success()
+        && tmp.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("toon conversion failed or produced empty output");
+    }
+    std::fs::rename(&tmp, toon_path).context("installing compiled .toon")?;
+    Ok(())
+}
+
+/// Ensure `rules-md/<stem>.toon` is a symlink to the live `rules/<stem>.toon`.
+fn ensure_toon_symlink(stem: &str) {
+    let target = rules_dir().join(format!("{stem}.toon"));
+    if !target.exists() {
+        return;
+    }
+    let link = rules_md_dir().join(format!("{stem}.toon"));
+    // Refresh: drop any stale link/file, then recreate.
+    let _ = std::fs::remove_file(&link);
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+}
+
+/// One-time / idempotent bootstrap: build the readable `.md` mirror and make
+/// `~/.claude/rules/` strictly `.toon`-only. Safe: never removes a `.md` from
+/// rules/ unless its `.toon` exists non-empty. Returns a summary string.
+fn rules_sync() -> Result<String> {
+    let rules = rules_dir();
+    let mirror = rules_md_dir();
+    std::fs::create_dir_all(&mirror)?;
+
+    let mut created = 0usize;
+    let mut compiled = 0usize;
+    let mut pruned = 0usize;
+    let mut orphaned: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    for stem in list_rule_stems() {
+        // Files that must stay human-editable .md in rules/ — never toon-ify.
+        if stem == "Comprehensive_Rules" {
+            continue;
+        }
+        let live_md = rules.join(format!("{stem}.md"));
+        let live_toon = rules.join(format!("{stem}.toon"));
+        let master = mirror.join(format!("{stem}.md"));
+
+        if live_md.exists() {
+            // .md-source rule: seed the master if absent, compile, then drop the
+            // .md from rules/ only once the .toon is safely written.
+            if !master.exists() {
+                match std::fs::read_to_string(&live_md) {
+                    Ok(t) => {
+                        if std::fs::write(&master, t).is_ok() {
+                            created += 1;
+                        }
+                    }
+                    Err(e) => warnings.push(format!("{stem}: read live .md failed: {e}")),
+                }
+            }
+            match md_to_toon(&master, &live_toon) {
+                Ok(()) => {
+                    compiled += 1;
+                    let _ = std::fs::remove_file(&live_md); // now .toon-only
+                }
+                Err(e) => warnings.push(format!(
+                    "{stem}: kept .md in rules/ (conversion failed: {e})"
+                )),
+            }
+        } else if live_toon.exists() {
+            // .toon-only rule: create a readable master from backup/decode; do
+            // NOT recompile the existing .toon (a lossy decode round-trip would
+            // degrade it). It is regenerated only when the user edits.
+            if !master.exists() {
+                if let Some((text, _)) = rule_readable(&stem) {
+                    if std::fs::write(&master, text).is_ok() {
+                        created += 1;
+                    }
+                }
+            }
+        }
+
+        // Self-heal: if a compiled .toon exists, (re)point the symlink; otherwise
+        // the rule was removed from rules/ externally — prune the dead symlink and
+        // flag the orphaned master (never auto-delete a master = no data loss, and
+        // never auto-recompile = a deprecated rule is not resurrected).
+        if live_toon.exists() {
+            ensure_toon_symlink(&stem);
+        } else {
+            let link = mirror.join(format!("{stem}.toon"));
+            if std::fs::symlink_metadata(&link).is_ok() {
+                let _ = std::fs::remove_file(&link);
+                pruned += 1;
+            }
+            if master.exists() {
+                orphaned.push(stem.clone());
+            }
+        }
+    }
+
+    let mut summary = format!(
+        "rules-sync: {created} master(s) created, {compiled} compiled, {pruned} dead symlink(s) pruned, {} orphaned master(s), {} warning(s)",
+        orphaned.len(),
+        warnings.len()
+    );
+    if !orphaned.is_empty() {
+        summary.push_str(&format!(
+            "\n  orphaned (in rules-md but removed from rules/): {}",
+            orphaned.join(", ")
+        ));
+    }
+    for w in &warnings {
+        summary.push_str(&format!("\n  ! {w}"));
+    }
+    Ok(summary)
+}
+
+/// Tokenizer's manifest + backup store (macOS Application Support path).
+fn tokenizer_manifest_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/Application Support/tokenizer/manifest.jsonl")
+}
+
+/// All rule base-names (stems), union of `.md`/`.toon` in ~/.claude/rules and the
+/// readable masters in ~/.claude/rules-md. Deduped + sorted; skips conversion.log.
+fn list_rule_stems() -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for dir in [rules_dir(), rules_md_dir()] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("md") | Some("toon") => {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            set.insert(stem.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Look up the backup (original .md) path for a converted .toon via Tokenizer's
+/// manifest.jsonl. Returns the most recent matching backup_path that exists.
+fn manifest_backup_for(converted: &std::path::Path) -> Option<PathBuf> {
+    let manifest = std::fs::read_to_string(tokenizer_manifest_path()).ok()?;
+    let target = converted.to_string_lossy();
+    let mut found: Option<PathBuf> = None;
+    for line in manifest.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["converted_path"].as_str() == Some(target.as_ref()) {
+            if let Some(bp) = v["backup_path"].as_str() {
+                let p = PathBuf::from(bp);
+                if p.exists() {
+                    found = Some(p); // keep last (most recent) match
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Title-case a space-separated identifier ("agent_spawning" → "Agent Spawning").
+fn titlecase(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Best-effort render of a Tokenizer `.toon` back to readable Markdown. TOON has
+/// no lossless decoder, but the common cues recover most readability: `>>name`
+/// section markers become headers, frontmatter/`@type` noise is dropped, and the
+/// pervasive `\n`/`\"` escapes are unescaped so embedded markdown + code render.
+fn toon_to_readable(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_frontmatter = false;
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if idx == 0 && trimmed == "---" {
+            in_frontmatter = true;
+            continue;
+        }
+        if in_frontmatter {
+            if trimmed == "---" {
+                in_frontmatter = false;
+            } else if let Some(d) = trimmed.strip_prefix("description:") {
+                out.push_str("> ");
+                out.push_str(d.trim());
+                out.push_str("\n\n");
+            }
+            continue;
+        }
+        if trimmed.starts_with("@type:") {
+            continue;
+        }
+        if let Some(h) = trimmed.strip_prefix(">>") {
+            out.push_str(&format!("\n## {}\n", titlecase(&h.replace('_', " "))));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Unescape the common TOON string escapes so code fences + lists render.
+    out.replace("\\n", "\n")
+        .replace("\\\"", "\"")
+        .replace("\\t", "    ")
+}
+
+/// Resolve a rule to readable Markdown text plus the canonical on-disk format.
+/// Prefers the readable master in rules-md, then a live `.md` in rules, then the
+/// Tokenizer backup, then a best-effort decode of the raw `.toon`.
+fn rule_readable(stem: &str) -> Option<(String, RuleFormat)> {
+    let master = rules_md_dir().join(format!("{stem}.md"));
+    if master.exists() {
+        return std::fs::read_to_string(&master)
+            .ok()
+            .map(|t| (t, RuleFormat::Md));
+    }
+    let dir = rules_dir();
+    let md = dir.join(format!("{stem}.md"));
+    if md.exists() {
+        return std::fs::read_to_string(&md).ok().map(|t| (t, RuleFormat::Md));
+    }
+    let toon = dir.join(format!("{stem}.toon"));
+    if toon.exists() {
+        if let Some(backup) = manifest_backup_for(&toon) {
+            if let Ok(text) = std::fs::read_to_string(&backup) {
+                return Some((text, RuleFormat::Toon));
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(&toon) {
+            let rendered = format!(
+                "<!-- decoded from {stem}.toon (no original backup); edit + save to create a readable master -->\n\n{}",
+                toon_to_readable(&raw)
+            );
+            return Some((rendered, RuleFormat::Toon));
+        }
+    }
+    None
+}
+
+/// Ensure a readable master exists at `rules-md/<stem>.md`, returning its path.
+/// Self-heals by materializing from `rule_readable` if the master is missing.
+fn ensure_rule_master(stem: &str) -> Option<PathBuf> {
+    let master = rules_md_dir().join(format!("{stem}.md"));
+    if master.exists() {
+        return Some(master);
+    }
+    let (text, _) = rule_readable(stem)?;
+    std::fs::create_dir_all(rules_md_dir()).ok()?;
+    std::fs::write(&master, text).ok()?;
+    Some(master)
+}
+
+/// Compile the edited master `rules-md/<stem>.md` into `rules/<stem>.toon` and
+/// refresh the symlink. On converter failure the previous `.toon` is preserved
+/// (md_to_toon writes atomically via a temp file). Returns Ok(()) on success.
+fn compile_rule_master(stem: &str) -> Result<()> {
+    let master = rules_md_dir().join(format!("{stem}.md"));
+    let toon = rules_dir().join(format!("{stem}.toon"));
+    md_to_toon(&master, &toon)?;
+    ensure_toon_symlink(stem);
+    Ok(())
+}
+
+/// Open `path` in $EDITOR (fallback `vi`) with the TUI suspended, then restore.
+fn edit_file_external<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    path: &std::path::Path,
+) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    suspend_tui(terminal)?;
+    let _ = std::process::Command::new(&editor).arg(path).status();
+    resume_tui(terminal)?;
+    Ok(())
+}
+
+/// Render a scrollable plain-text panel (used by the CLAUDE.md tab).
+fn render_text_tab(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    title: &str,
+    body: &str,
+    scroll: u16,
+) {
+    use ratatui::widgets::*;
+    let p = Paragraph::new(body)
+        .style(theme::row_normal())
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme::border())
+                .title(format!(" {title} "))
+                .title_style(theme::title()),
+        );
+    f.render_widget(p, area);
+}
+
+/// Render the RULES tab: list of rule stems on the left, readable preview right.
+#[allow(clippy::too_many_arguments)]
+fn render_rules_tab(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    stems: &[String],
+    selected: usize,
+    preview: &str,
+    fmt: Option<RuleFormat>,
+    scroll: u16,
+) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(34), Constraint::Min(20)])
+        .split(area);
+
+    let items: Vec<ListItem> = stems
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let style = if i == selected {
+                Style::default().bg(theme::accent()).fg(theme::bg())
+            } else {
+                theme::row_normal()
+            };
+            ListItem::new(s.clone()).style(style)
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border())
+            .title(format!(" Rules ({}) ", stems.len()))
+            .title_style(theme::title()),
+    );
+    f.render_widget(list, chunks[0]);
+
+    let fmt_label = match fmt {
+        Some(RuleFormat::Md) => "md",
+        Some(RuleFormat::Toon) => "toon\u{2192}readable",
+        None => "\u{2014}",
+    };
+    let title = match stems.get(selected) {
+        Some(s) => format!(" {s} [{fmt_label}]  \u{2014}  e:edit  j/k:select  PgUp/PgDn:scroll "),
+        None => " (no rules) ".to_string(),
+    };
+    let p = Paragraph::new(preview)
+        .style(theme::row_normal())
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme::border())
+                .title(title)
+                .title_style(theme::title()),
+        );
+    f.render_widget(p, chunks[1]);
 }
 
 // ── Overlay states ──────────────────────────────────────────────────
@@ -501,7 +1407,18 @@ fn run_list_ui<W: std::io::Write>(
 
     let mut selected = 0usize;
     let mut focus = FocusPanel::Table;
+    let mut active_tab = Tab::Projects;
     let mut overlay = Overlay::None;
+
+    // CLAUDE.md tab state: true = global (~/.claude/CLAUDE.md), false = project.
+    let mut claude_md_global = true;
+    let mut claude_scroll: u16 = 0;
+    // RULES tab state.
+    let rule_stems = list_rule_stems();
+    let mut rule_sel: usize = 0;
+    let mut rule_scroll: u16 = 0;
+    let mut rule_cache: Option<(String, Option<RuleFormat>)> = None;
+    let mut rule_compile_status: Option<String> = None;
 
     // Stored panel areas for mouse hit-testing
     let mut table_area = Rect::default();
@@ -526,6 +1443,42 @@ fn run_list_ui<W: std::io::Write>(
             .as_ref()
             .map(|ts| filetree::flatten(&ts.root))
             .unwrap_or_default();
+
+        let tokstat = tok_status();
+
+        // CLAUDE.md tab body (read fresh each frame; files are small).
+        let claude_path = if claude_md_global {
+            claude_md_global_path()
+        } else {
+            claude_md_project_path()
+        };
+        let claude_body = std::fs::read_to_string(&claude_path).unwrap_or_else(|_| {
+            format!("(no file at {})", claude_path.display())
+        });
+        let claude_title = if claude_md_global {
+            "CLAUDE.md [global ~/.claude]  —  g/p:switch  e:edit  j/k:scroll"
+        } else {
+            "CLAUDE.md [project ~/]  —  g/p:switch  e:edit  j/k:scroll"
+        };
+
+        // RULES tab preview (lazily cached; invalidated on selection change).
+        if active_tab == Tab::Rules && rule_cache.is_none() {
+            rule_cache = Some(match rule_stems.get(rule_sel) {
+                Some(stem) => match rule_readable(stem) {
+                    Some((text, fmt)) => (text, Some(fmt)),
+                    None => ("(unreadable rule)".to_string(), None),
+                },
+                None => ("(no rules found)".to_string(), None),
+            });
+        }
+        let (rule_preview_body, rule_fmt) = rule_cache
+            .clone()
+            .unwrap_or_else(|| (String::new(), None));
+        // Prepend the last compile/save status banner, if any.
+        let rule_preview = match &rule_compile_status {
+            Some(s) => format!("» {s}\n\n{rule_preview_body}"),
+            None => rule_preview_body,
+        };
 
         terminal.draw(|f| {
             let area = f.area();
@@ -561,18 +1514,64 @@ fn run_list_ui<W: std::io::Write>(
                     .split(area)
             };
 
-            // Title bar
-            let title = Paragraph::new(format!(
-                " Projectwise \u{2500} {} ({} projects)",
-                mode, projects.len()
-            ))
-            .style(theme::title())
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme::border())
-                .border_type(BorderType::Rounded));
-            f.render_widget(title, vertical_chunks[0]);
+            // Title bar with tabs
+            let tabs = Tabs::new(vec![
+                Line::from(" 1 Projects "),
+                Line::from(" 2 Tokenizer "),
+                Line::from(" 3 CLAUDE.md "),
+                Line::from(" 4 RULES "),
+            ])
+            .select(active_tab.index())
+            .style(theme::dim())
+            .highlight_style(
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider("|")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::border())
+                    .border_type(BorderType::Rounded)
+                    .title(format!(
+                        " Projectwise \u{2500} {} ({} projects) ",
+                        mode,
+                        projects.len()
+                    ))
+                    .title_style(theme::title()),
+            );
+            f.render_widget(tabs, vertical_chunks[0]);
 
+            // Content area spanning everything between the tab bar and footer
+            // (used by non-Projects tabs).
+            let tok_content_area = {
+                let last = vertical_chunks.len() - 1;
+                let top = vertical_chunks[0];
+                let ftr = vertical_chunks[last];
+                Rect::new(
+                    area.x,
+                    top.y + top.height,
+                    area.width,
+                    ftr.y.saturating_sub(top.y + top.height),
+                )
+            };
+
+            if active_tab == Tab::Tokenizer {
+                render_tokenizer_tab(f, tok_content_area, &tokstat);
+            } else if active_tab == Tab::ClaudeMd {
+                render_text_tab(f, tok_content_area, claude_title, &claude_body, claude_scroll);
+            } else if active_tab == Tab::Rules {
+                render_rules_tab(
+                    f,
+                    tok_content_area,
+                    &rule_stems,
+                    rule_sel,
+                    &rule_preview,
+                    rule_fmt,
+                    rule_scroll,
+                );
+            } else {
             // Table (panel index 1)
             table_area = vertical_chunks[1];
             let table_border_style = if focus == FocusPanel::Table {
@@ -811,12 +1810,19 @@ fn run_list_ui<W: std::io::Write>(
                 tree_area = None;
                 _info_area = None;
             }
+            } // end Projects-tab content
 
             // Footer
-            let footer_text = if show_tree {
-                " q:Quit  j/k:\u{2191}\u{2193}  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
+            let footer_text: &str = if active_tab == Tab::Tokenizer {
+                " q:Quit  [ ]:Switch tab  o:Optimize  T:Tokenizer-TUI  i:Install-Timer  h:Install-Hook"
+            } else if active_tab == Tab::ClaudeMd {
+                " q:Quit  [ ]:Switch tab  g/p:Global/Project  e:Edit  j/k:Scroll"
+            } else if active_tab == Tab::Rules {
+                " q:Quit  [ ]:Switch tab  j/k:Select  e:Edit  PgUp/PgDn:Scroll"
+            } else if show_tree {
+                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
             } else {
-                " q:Quit  j/k:\u{2191}\u{2193}  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
+                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
             };
             let footer_idx = if show_tree { vertical_chunks.len() - 1 } else { 2 };
             let footer = Paragraph::new(footer_text).style(theme::dim());
@@ -854,6 +1860,123 @@ fn run_list_ui<W: std::io::Write>(
                 Event::Key(key) => {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                        KeyCode::Char(']') => active_tab = active_tab.next(),
+                        KeyCode::Char('[') => active_tab = active_tab.prev(),
+                        KeyCode::Char('1') => active_tab = Tab::Projects,
+                        KeyCode::Char('2') => active_tab = Tab::Tokenizer,
+                        KeyCode::Char('3') => active_tab = Tab::ClaudeMd,
+                        KeyCode::Char('4') => active_tab = Tab::Rules,
+                        KeyCode::Char('/') if active_tab == Tab::Projects => {
+                            if let Some(folder) = run_project_search(terminal, home)? {
+                                if let Some(idx) =
+                                    projects.iter().position(|p| p.folder_name == folder)
+                                {
+                                    selected = virtual_count + idx;
+                                    update_tree_for_selection(
+                                        selected,
+                                        virtual_count,
+                                        &projects,
+                                        home,
+                                        &mut tree_state,
+                                    );
+                                }
+                            }
+                        }
+                        KeyCode::Char('o') if active_tab == Tab::Tokenizer => {
+                            spawn_tokenizer_optimize();
+                        }
+                        KeyCode::Char('T') if active_tab == Tab::Tokenizer => {
+                            suspend_tui(terminal)?;
+                            let _ = run_tokenizer_cmd(&["tui"]);
+                            resume_tui(terminal)?;
+                        }
+                        KeyCode::Char('i') if active_tab == Tab::Tokenizer => {
+                            suspend_tui(terminal)?;
+                            let _ = run_tokenizer_cmd(&["install-timer"]);
+                            resume_tui(terminal)?;
+                        }
+                        KeyCode::Char('h') if active_tab == Tab::Tokenizer => {
+                            suspend_tui(terminal)?;
+                            let _ = run_tokenizer_cmd(&["install-hook"]);
+                            resume_tui(terminal)?;
+                        }
+                        // ── CLAUDE.md tab ──
+                        KeyCode::Char('g') if active_tab == Tab::ClaudeMd => {
+                            claude_md_global = true;
+                            claude_scroll = 0;
+                        }
+                        KeyCode::Char('p') if active_tab == Tab::ClaudeMd => {
+                            claude_md_global = false;
+                            claude_scroll = 0;
+                        }
+                        KeyCode::Char('e') if active_tab == Tab::ClaudeMd => {
+                            let path = if claude_md_global {
+                                claude_md_global_path()
+                            } else {
+                                claude_md_project_path()
+                            };
+                            edit_file_external(terminal, &path)?;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::ClaudeMd => {
+                            claude_scroll = claude_scroll.saturating_add(1);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up if active_tab == Tab::ClaudeMd => {
+                            claude_scroll = claude_scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown if active_tab == Tab::ClaudeMd => {
+                            claude_scroll = claude_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp if active_tab == Tab::ClaudeMd => {
+                            claude_scroll = claude_scroll.saturating_sub(10);
+                        }
+                        // ── RULES tab ──
+                        KeyCode::Char('e') if active_tab == Tab::Rules => {
+                            if let Some(stem) = rule_stems.get(rule_sel).cloned() {
+                                // Edit the persistent readable master in rules-md;
+                                // on save, recompile it into the .toon Claude reads.
+                                if let Some(master) = ensure_rule_master(&stem) {
+                                    let before =
+                                        std::fs::read_to_string(&master).unwrap_or_default();
+                                    edit_file_external(terminal, &master)?;
+                                    let after =
+                                        std::fs::read_to_string(&master).unwrap_or_default();
+                                    if after != before {
+                                        rule_compile_status = Some(match compile_rule_master(&stem)
+                                        {
+                                            Ok(()) => format!("{stem}: saved + compiled to .toon"),
+                                            Err(e) => format!(
+                                                "{stem}: master saved; .toon NOT updated ({e})"
+                                            ),
+                                        });
+                                    }
+                                    rule_cache = None;
+                                    rule_scroll = 0;
+                                }
+                            }
+                        }
+                        KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::Rules => {
+                            if !rule_stems.is_empty() {
+                                rule_sel = (rule_sel + 1) % rule_stems.len();
+                                rule_cache = None;
+                                rule_scroll = 0;
+                                rule_compile_status = None;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up if active_tab == Tab::Rules => {
+                            if !rule_stems.is_empty() {
+                                rule_sel =
+                                    (rule_sel + rule_stems.len() - 1) % rule_stems.len();
+                                rule_cache = None;
+                                rule_scroll = 0;
+                                rule_compile_status = None;
+                            }
+                        }
+                        KeyCode::PageDown if active_tab == Tab::Rules => {
+                            rule_scroll = rule_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp if active_tab == Tab::Rules => {
+                            rule_scroll = rule_scroll.saturating_sub(10);
+                        }
                         KeyCode::Tab => {
                             focus = focus.next();
                         }
@@ -935,7 +2058,7 @@ fn run_list_ui<W: std::io::Write>(
                                 // Theme changed, continue rendering with new colors
                             }
                         }
-                        KeyCode::Char('x') | KeyCode::Delete => {
+                        KeyCode::Char('x') | KeyCode::Delete if active_tab == Tab::Projects => {
                             if focus == FocusPanel::Table
                                 && selected >= virtual_count
                                 && selected - virtual_count < projects.len()
@@ -945,7 +2068,7 @@ fn run_list_ui<W: std::io::Write>(
                                 };
                             }
                         }
-                        KeyCode::Char('r') => {
+                        KeyCode::Char('r') if active_tab == Tab::Projects => {
                             if focus == FocusPanel::Table
                                 && selected >= virtual_count
                                 && selected - virtual_count < projects.len()
@@ -960,7 +2083,7 @@ fn run_list_ui<W: std::io::Write>(
                                 };
                             }
                         }
-                        KeyCode::Char('s') => {
+                        KeyCode::Char('s') if active_tab == Tab::Projects => {
                             // Status picker shortcut
                             if focus == FocusPanel::Table
                                 && selected >= virtual_count
@@ -972,7 +2095,7 @@ fn run_list_ui<W: std::io::Write>(
                                 };
                             }
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if active_tab == Tab::Projects => {
                             // Category picker shortcut with auto-detection
                             if focus == FocusPanel::Table
                                 && selected >= virtual_count
@@ -992,7 +2115,7 @@ fn run_list_ui<W: std::io::Write>(
                                 };
                             }
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter if active_tab == Tab::Projects => {
                             if select_mode {
                                 if selected == 0 {
                                     return Ok(Some(VIRTUAL_QUICK_SESSION.to_string()));
@@ -1008,7 +2131,7 @@ fn run_list_ui<W: std::io::Write>(
                         _ => {}
                     }
                 }
-                Event::Mouse(mouse) => {
+                Event::Mouse(mouse) if active_tab == Tab::Projects => {
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
@@ -1492,17 +2615,24 @@ fn handle_overlay_event(
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => OverlayAction::Close,
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *selected = (*selected + 1) % options.len();
+                    if !options.is_empty() {
+                        *selected = (*selected + 1) % options.len();
+                    }
                     OverlayAction::Consumed
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    *selected = selected.checked_sub(1).unwrap_or(options.len() - 1);
+                    if !options.is_empty() {
+                        *selected = selected.checked_sub(1).unwrap_or(options.len() - 1);
+                    }
                     OverlayAction::Consumed
                 }
                 KeyCode::Enter => {
                     let row_val = *row;
                     let sel = *selected;
-                    let chosen = options[sel].clone();
+                    let chosen = match options.get(sel) {
+                        Some(c) => c.clone(),
+                        None => return OverlayAction::Close,
+                    };
                     if chosen == "Custom..." {
                         // Switch to text input overlay
                         *overlay = Overlay::TextInput {
@@ -1545,23 +2675,43 @@ fn handle_overlay_event(
                 OverlayAction::Close
             }
             KeyCode::Char(c) => {
+                // cursor is a byte index; insert keeps it valid.
                 input.insert(*cursor, c);
-                *cursor += 1;
+                *cursor += c.len_utf8();
                 OverlayAction::Consumed
             }
             KeyCode::Backspace => {
                 if *cursor > 0 {
-                    *cursor -= 1;
-                    input.remove(*cursor);
+                    // Step back by one char (not one byte).
+                    let prev = input[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    input.remove(prev);
+                    *cursor = prev;
                 }
                 OverlayAction::Consumed
             }
             KeyCode::Left => {
-                *cursor = cursor.saturating_sub(1);
+                // Move cursor back by one char.
+                *cursor = input[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
                 OverlayAction::Consumed
             }
             KeyCode::Right => {
-                *cursor = (*cursor + 1).min(input.len());
+                // Move cursor forward by one char.
+                if *cursor < input.len() {
+                    let next = input[*cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| *cursor + i)
+                        .unwrap_or(input.len());
+                    *cursor = next;
+                }
                 OverlayAction::Consumed
             }
             _ => OverlayAction::Consumed,
@@ -1595,23 +2745,43 @@ fn handle_overlay_event(
                 OverlayAction::Close
             }
             KeyCode::Char(c) => {
+                // cursor is a byte index; insert keeps it valid.
                 input.insert(*cursor, c);
-                *cursor += 1;
+                *cursor += c.len_utf8();
                 OverlayAction::Consumed
             }
             KeyCode::Backspace => {
                 if *cursor > 0 {
-                    *cursor -= 1;
-                    input.remove(*cursor);
+                    // Step back by one char (not one byte).
+                    let prev = input[..*cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    input.remove(prev);
+                    *cursor = prev;
                 }
                 OverlayAction::Consumed
             }
             KeyCode::Left => {
-                *cursor = cursor.saturating_sub(1);
+                // Move cursor back by one char.
+                *cursor = input[..*cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
                 OverlayAction::Consumed
             }
             KeyCode::Right => {
-                *cursor = (*cursor + 1).min(input.len());
+                // Move cursor forward by one char.
+                if *cursor < input.len() {
+                    let next = input[*cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| *cursor + i)
+                        .unwrap_or(input.len());
+                    *cursor = next;
+                }
                 OverlayAction::Consumed
             }
             _ => OverlayAction::Consumed,
@@ -2192,18 +3362,47 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 fn cmd_shell_init() -> Result<()> {
     print!(
         r#"# Projectwise — shell integration
-# Generated by cpm shell-init v3.4.0
+# Generated by cpm shell-init v3.7.1
+
+# Ensure Tokenizer is installed (once) and fire a background boost so Claude
+# starts with freshly-compressed .toon context. Fail-open: never blocks launch.
+_projectwise_tokenizer() {{
+  local tok="${{TOKENIZER_BIN:-$HOME/.cargo/bin/tokenizer}}"
+  [[ -x "$tok" ]] || return 0
+  case "$OSTYPE" in
+    darwin*) [[ -f "$HOME/Library/LaunchAgents/com.tokenizer.plist" ]] || "$tok" install-timer >/dev/null 2>&1 ;;
+    *)       [[ -f "$HOME/.config/systemd/user/tokenizer.timer" ]]      || "$tok" install-timer >/dev/null 2>&1 ;;
+  esac
+  [[ -f "$HOME/.claude/hooks/tokenizer-post-session.sh" ]] || "$tok" install-hook >/dev/null 2>&1
+  ( "$tok" optimize --quiet >/dev/null 2>&1 & ) 2>/dev/null
+}}
+
+# Launch Claude with the session interview directive (always) plus the context
+# digest as the initial prompt when present.
+_projectwise_launch() {{
+  local _dir="$1"; shift
+  local _digest="$_dir/.projectwise/context-digest.md"
+  local _interview="Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed."
+  if [[ -s "$_digest" ]]; then
+    command claude --dangerously-skip-permissions "$_interview Then read the file $_digest -- it is the latest PROGRESS + ARCHITECTURE snapshot for this project; absorb it before interviewing me." "$@"
+  else
+    command claude --dangerously-skip-permissions "$_interview" "$@"
+  fi
+}}
+
 projectwise() {{
   command -v claude &>/dev/null || {{ echo "Error: claude CLI not found" >&2; return 127; }}
   local _pd="${{CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}}"
+  _projectwise_tokenizer
+  ( cpm rules-sync >/dev/null 2>&1 & ) 2>/dev/null  # keep readable rule mirror fresh (idempotent)
   local _sel; _sel=$(cpm list --select) || return 1
   [[ -z "$_sel" ]] && return 1
   case "$_sel" in
     __QUICK_SESSION__) command claude --dangerously-skip-permissions "$@" ;;
     __NEW_PROJECT__)
       local _f; _f=$(cpm create) || return 1
-      cd "$_pd/$_f" && cpm pre-launch "$_f" && command claude --dangerously-skip-permissions "$@" ;;
-    *) cd "$_pd/$_sel" && cpm pre-launch "$_sel" && command claude --dangerously-skip-permissions "$@" ;;
+      cd "$_pd/$_f" && cpm pre-launch "$_f" && _projectwise_launch "$_pd/$_f" "$@" ;;
+    *) cd "$_pd/$_sel" && cpm pre-launch "$_sel" && _projectwise_launch "$_pd/$_sel" "$@" ;;
   esac
 }}
 clauded() {{ projectwise "$@"; }}
@@ -2289,25 +3488,19 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
     // Log session for stats
     let _ = sessions::log_session(folder);
 
-    let docs: Vec<&str> = ["PROJECT.md", "README.md", "PLAN.md", "PROGRESS.md"]
-        .iter()
-        .filter(|f| dir.join(f).exists())
-        .copied()
-        .collect();
-    if !docs.is_empty() {
-        let prompt = format!("Review docs? ({})", docs.join(", "));
-        if dialoguer::Confirm::new()
-            .with_prompt(&prompt)
-            .default(false)
-            .interact()?
-        {
-            let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
-            let paths: Vec<_> = docs
-                .iter()
-                .map(|f| dir.join(f).display().to_string())
-                .collect();
-            let _ = std::process::Command::new(&pager).args(&paths).status();
-        }
+    // Build the context digest (PROGRESS + ARCHITECTURE) so Claude absorbs the
+    // latest status on launch. The shell wrapper passes this file as Claude's
+    // initial prompt. Non-interactive, fail-open.
+    match build_context_digest(home, folder, &dir) {
+        Some(path) => eprintln!(
+            "{} context digest \u{2192} {}",
+            "\u{2713}".green(),
+            path.display()
+        ),
+        None => eprintln!(
+            "{} no PROGRESS/ARCHITECTURE found \u{2014} skipping context digest",
+            "i".blue()
+        ),
     }
     Ok(())
 }
@@ -2358,7 +3551,11 @@ fn cmd_archive(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> R
     }
     let archive_dir = std::env::var("CLAUDE_ARCHIVE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/archive"));
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude/archive")
+        });
     std::fs::create_dir_all(&archive_dir)?;
     let src = safe_join(home, folder)?;
     if src.exists() {
@@ -2373,7 +3570,11 @@ fn cmd_restore(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> R
     validate_folder_name(folder)?;
     let archive_dir = std::env::var("CLAUDE_ARCHIVE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap().join(".claude/archive"));
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude/archive")
+        });
     let src = safe_join(&archive_dir, folder)?;
     if !src.exists() {
         anyhow::bail!("archive not found: {}", src.display());
@@ -2637,4 +3838,176 @@ fn format_size(bytes: u64) -> String {
         return format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
     }
     format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn titlecase_basics() {
+        assert_eq!(titlecase("agent spawning"), "Agent Spawning");
+        assert_eq!(titlecase("when_to_suggest"), "When_to_suggest");
+        assert_eq!(titlecase(""), "");
+    }
+
+    #[test]
+    fn toon_to_readable_headers_and_unescape() {
+        let raw = "---\ndescription: a rule\nglobs: *\n---\n@type:rule\n>>section_one\n- item with code:\\nline2";
+        let out = toon_to_readable(raw);
+        assert!(out.contains("> a rule"), "frontmatter desc → blockquote: {out}");
+        assert!(out.contains("## Section One"), "section header: {out}");
+        assert!(!out.contains("@type:rule"), "drops @type noise: {out}");
+        assert!(out.contains("line2") && out.contains("item with code:\nline2"),
+            "unescapes \\n: {out:?}");
+    }
+
+    #[test]
+    fn tab_cycle_next_prev() {
+        assert_eq!(Tab::Projects.next(), Tab::Tokenizer);
+        assert_eq!(Tab::Rules.next(), Tab::Projects);
+        assert_eq!(Tab::Projects.prev(), Tab::Rules);
+        assert_eq!(Tab::Tokenizer.prev(), Tab::Projects);
+        assert_eq!(Tab::ClaudeMd.index(), 2);
+    }
+
+    #[test]
+    fn strip_html_drops_scripts_and_tags() {
+        let html = "<html><head><style>x{}</style></head><body><script>bad()</script><p>Hello <b>world</b></p></body></html>";
+        let out = strip_html(html);
+        assert!(out.contains("Hello") && out.contains("world"), "keeps text: {out}");
+        assert!(!out.contains("bad()"), "drops script body: {out}");
+        assert!(!out.contains('<'), "drops tags: {out}");
+    }
+
+    // Single test for env-dependent converter logic (avoids set_var races that
+    // would occur if these ran as separate parallel tests).
+    #[test]
+    fn converter_bins_and_safety_guard() {
+        // (1) env override wins for both resolvers.
+        std::env::set_var("TOON_BIN", "/tmp/custom-toon");
+        assert_eq!(toon_bin(), std::path::PathBuf::from("/tmp/custom-toon"));
+
+        // (2) a missing converter errors AND preserves the existing .toon.
+        std::env::set_var("MD_TO_JSON_BIN", "/nonexistent/md2json-xyz");
+        assert_eq!(
+            md_to_json_bin(),
+            std::path::PathBuf::from("/nonexistent/md2json-xyz")
+        );
+        let dir = std::env::temp_dir().join("cpm_md_to_toon_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let md = dir.join("r.md");
+        let toon = dir.join("r.toon");
+        std::fs::write(&md, "# hi\n").unwrap();
+        std::fs::write(&toon, "OLD_TOON").unwrap();
+        let res = md_to_toon(&md, &toon);
+        assert!(res.is_err(), "missing converter must error");
+        assert_eq!(
+            std::fs::read_to_string(&toon).unwrap(),
+            "OLD_TOON",
+            "previous .toon must be preserved on failure"
+        );
+
+        std::env::remove_var("MD_TO_JSON_BIN");
+        std::env::remove_var("TOON_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_folder_name_accepts_valid() {
+        assert!(validate_folder_name("hello-world").is_ok());
+        assert!(validate_folder_name("Foo_Bar.123").is_ok());
+        assert!(validate_folder_name("a").is_ok());
+    }
+
+    #[test]
+    fn validate_folder_name_rejects_invalid() {
+        assert!(validate_folder_name("").is_err());
+        assert!(validate_folder_name(".").is_err());
+        assert!(validate_folder_name("..").is_err());
+        assert!(validate_folder_name("../evil").is_err());
+        assert!(validate_folder_name("hello world").is_err()); // space
+        assert!(validate_folder_name("a/b").is_err());         // slash
+        assert!(validate_folder_name("a\0b").is_err());        // null byte
+    }
+
+    #[test]
+    fn safe_join_prevents_traversal() {
+        let tmp = std::env::temp_dir();
+        // A name that passes validate but could theoretically escape — validate_folder_name
+        // already rejects ".." and slashes, so safe_join is a second layer check.
+        assert!(safe_join(&tmp, "legit-project").is_ok());
+        // validate_folder_name rejects ".." before safe_join can even check.
+        assert!(safe_join(&tmp, "..").is_err());
+    }
+
+    #[test]
+    fn strip_html_with_multibyte_chars() {
+        // Non-ASCII text outside of tags must survive strip_html without panic.
+        let html = "<p>héllo</p><b>wörld</b>";
+        let out = strip_html(html);
+        assert!(out.contains("héllo"), "multibyte text preserved: {out}");
+        assert!(out.contains("wörld"), "multibyte text preserved: {out}");
+        assert!(!out.contains('<'), "tags removed: {out}");
+    }
+
+    #[test]
+    fn strip_html_empty_and_no_tags() {
+        assert_eq!(strip_html(""), "");
+        assert_eq!(strip_html("plain text"), "plain text");
+    }
+
+    // Verify cursor byte-offset arithmetic for multibyte char input.
+    // We simulate what the TextInput overlay key handler does.
+    #[test]
+    fn text_input_cursor_multibyte() {
+        let mut input = String::new();
+        let mut cursor: usize = 0;
+
+        // Type 'é' (2 bytes in UTF-8)
+        let c = 'é';
+        input.insert(cursor, c);
+        cursor += c.len_utf8();
+        assert_eq!(cursor, 2);
+        assert_eq!(input, "é");
+
+        // Type 'a'
+        let c = 'a';
+        input.insert(cursor, c);
+        cursor += c.len_utf8();
+        assert_eq!(cursor, 3);
+        assert_eq!(input, "éa");
+
+        // Backspace (remove 'a', cursor back to 2)
+        {
+            let prev = input[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            input.remove(prev);
+            cursor = prev;
+        }
+        assert_eq!(cursor, 2);
+        assert_eq!(input, "é");
+
+        // Left arrow (move back over 'é', cursor → 0)
+        cursor = input[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert_eq!(cursor, 0);
+
+        // Right arrow (move forward over 'é', cursor → 2)
+        {
+            let next = input[cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| cursor + i)
+                .unwrap_or(input.len());
+            cursor = next;
+        }
+        assert_eq!(cursor, 2);
+    }
 }

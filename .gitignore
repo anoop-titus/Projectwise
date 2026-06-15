@@ -2,6 +2,11 @@
 .cache/
 .tldr/
 
+# PROGRESS dashboard render artifacts (source of truth is ~/.claude/progress/tasks.json).
+# PROGRESS.md / ARCHITECTURE.md / CONTEXT.* stay tracked.
+PROGRESS.html
+.progress/
+
 # Local IDE/editor settings
 .claude/settings.local.json
 
