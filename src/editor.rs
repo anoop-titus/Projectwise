@@ -27,6 +27,9 @@ fn byte_at(s: &str, n: usize) -> usize {
 impl TextEditor {
     pub fn from_str(s: &str) -> Self {
         let mut lines: Vec<String> = s.split('\n').map(|l| l.to_string()).collect();
+        // `str::split('\n')` always yields ≥1 element (e.g. "" → [""]), so this
+        // is belt-and-suspenders — but it makes the "lines is never empty"
+        // invariant (relied on by cur_len/indexing) explicit and local.
         if lines.is_empty() {
             lines.push(String::new());
         }
@@ -159,6 +162,12 @@ impl TextEditor {
 
     /// Render into `area` with a bordered block titled `title`; `status` is shown
     /// on the last inner row. Places the terminal cursor at the editing point.
+    ///
+    /// NOTE: horizontal math (offset, slice length, cursor column) treats each
+    /// `char` as ONE display cell. This is correct for ASCII/Latin text — the
+    /// expected content (CLAUDE.md, intro-prompt templates). Wide glyphs
+    /// (CJK/emoji, 2 cells) will mis-track the cursor and over-fill the line; it
+    /// never panics. Switch to unicode-width if full wide-char support is needed.
     pub fn render(
         &mut self,
         f: &mut ratatui::Frame,

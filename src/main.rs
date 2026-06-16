@@ -1529,6 +1529,7 @@ fn run_editor<W: std::io::Write>(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
     title: &str,
     path: &std::path::Path,
+    reject_empty: bool,
 ) -> Result<bool> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     let initial = std::fs::read_to_string(path).unwrap_or_default();
@@ -1557,10 +1558,15 @@ fn run_editor<W: std::io::Write>(
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Char('s') if ctrl => {
+                        let content = ed.to_string();
+                        if reject_empty && content.trim().is_empty() {
+                            status = "Refusing to save an empty template (would break session launch); add text or Esc to cancel".to_string();
+                            continue;
+                        }
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        match std::fs::write(path, ed.to_string()) {
+                        match std::fs::write(path, content) {
                             Ok(()) => return Ok(true),
                             Err(e) => status = format!("save failed: {e}"),
                         }
@@ -2220,7 +2226,7 @@ fn run_list_ui<W: std::io::Write>(
                             } else {
                                 "CLAUDE.md (project ~/)"
                             };
-                            run_editor(terminal, title, &path)?;
+                            run_editor(terminal, title, &path, false)?;
                             claude_scroll = 0;
                         }
                         KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::ClaudeMd => {
@@ -2312,24 +2318,29 @@ fn run_list_ui<W: std::io::Write>(
                             intro_scroll = 0;
                         }
                         KeyCode::Char('e') if active_tab == Tab::IntroPrompt => {
-                            let path = if intro_global {
-                                ensure_intro_global()
+                            // Resolve path and title together so they can never
+                            // diverge: in project mode with no real project row
+                            // selected we fall back to the global template AND
+                            // say so, rather than mislabeling it a project override.
+                            let proj_dir = selected
+                                .checked_sub(virtual_count)
+                                .and_then(|i| projects.get(i))
+                                .map(|p| home.join(&p.folder_name));
+                            let (path, title) = if intro_global {
+                                (ensure_intro_global(), "Intro prompt (global)".to_string())
                             } else {
-                                match selected
-                                    .checked_sub(virtual_count)
-                                    .and_then(|i| projects.get(i))
-                                    .map(|p| home.join(&p.folder_name))
-                                {
-                                    Some(d) => intro_tmpl_project_path(&d),
-                                    None => ensure_intro_global(),
+                                match proj_dir {
+                                    Some(d) => (
+                                        intro_tmpl_project_path(&d),
+                                        "Intro prompt (project override)".to_string(),
+                                    ),
+                                    None => (
+                                        ensure_intro_global(),
+                                        "Intro prompt (global — no project selected)".to_string(),
+                                    ),
                                 }
                             };
-                            let title = if intro_global {
-                                "Intro prompt (global)".to_string()
-                            } else {
-                                "Intro prompt (project override)".to_string()
-                            };
-                            run_editor(terminal, &title, &path)?;
+                            run_editor(terminal, &title, &path, true)?;
                             intro_scroll = 0;
                         }
                         KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::IntroPrompt => {
@@ -2338,20 +2349,20 @@ fn run_list_ui<W: std::io::Write>(
                         KeyCode::Char('k') | KeyCode::Up if active_tab == Tab::IntroPrompt => {
                             intro_scroll = intro_scroll.saturating_sub(1);
                         }
-                        KeyCode::Tab => {
+                        KeyCode::Tab if active_tab == Tab::Projects => {
                             focus = focus.next();
                         }
-                        KeyCode::Right => {
+                        KeyCode::Right if active_tab == Tab::Projects => {
                             if focus == FocusPanel::Table {
                                 focus = FocusPanel::Tree;
                             }
                         }
-                        KeyCode::Left => {
+                        KeyCode::Left if active_tab == Tab::Projects => {
                             if focus == FocusPanel::Tree {
                                 focus = FocusPanel::Table;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => match focus {
+                        KeyCode::Down | KeyCode::Char('j') if active_tab == Tab::Projects => match focus {
                             FocusPanel::Table => {
                                 if (virtual_count + projects.len()) > 0 {
                                     selected = (selected + 1) % (virtual_count + projects.len());
@@ -2375,7 +2386,7 @@ fn run_list_ui<W: std::io::Write>(
                             }
                             FocusPanel::Info => {}
                         },
-                        KeyCode::Up | KeyCode::Char('k') => match focus {
+                        KeyCode::Up | KeyCode::Char('k') if active_tab == Tab::Projects => match focus {
                             FocusPanel::Table => {
                                 if (virtual_count + projects.len()) > 0 {
                                     selected = (selected + (virtual_count + projects.len()) - 1)
@@ -2400,7 +2411,7 @@ fn run_list_ui<W: std::io::Write>(
                             }
                             FocusPanel::Info => {}
                         },
-                        KeyCode::Char(' ') => {
+                        KeyCode::Char(' ') if active_tab == Tab::Projects => {
                             if focus == FocusPanel::Tree {
                                 let flat = tree_state
                                     .as_ref()
@@ -3744,13 +3755,18 @@ _projectwise_launch() {{
   local _dir="$1"; shift
   local _digest="$_dir/.projectwise/context-digest.md"
   # Intro prompt template: per-project override → global default → built-in.
-  # Edit either via Projectwise's Intro tab (key 6).
-  local _interview
-  if [[ -s "$_dir/.projectwise/intro-prompt.tmpl" ]]; then
-    _interview="$(cat "$_dir/.projectwise/intro-prompt.tmpl")"
-  elif [[ -s "$HOME/.claude/.projectwise/intro-prompt.tmpl" ]]; then
-    _interview="$(cat "$HOME/.claude/.projectwise/intro-prompt.tmpl")"
-  else
+  # Edit either via Projectwise's Intro tab (key 6). Guard on POST-cat content
+  # (whitespace-stripped), not file size: an empty/whitespace-only template must
+  # fall through to the default, never launch claude with an empty/junk arg.
+  local _interview="" _t
+  for _t in "$_dir/.projectwise/intro-prompt.tmpl" "$HOME/.claude/.projectwise/intro-prompt.tmpl"; do
+    if [[ -f "$_t" ]]; then
+      _interview="$(cat "$_t")"
+      [[ -n "${{_interview//[[:space:]]/}}" ]] && break
+      _interview=""
+    fi
+  done
+  if [[ -z "${{_interview//[[:space:]]/}}" ]]; then
     _interview="Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed."
   fi
   if [[ -s "$_digest" ]]; then
