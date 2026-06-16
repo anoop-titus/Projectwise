@@ -14,11 +14,14 @@ flowchart TD
     RUN_LIST_UI["<b>run_list_ui</b><br/>(event loop + tabs)"]
     TREE["<b>filetree.rs</b><br/>(directory widget)"]
     SESSIONS["<b>sessions.rs</b><br/>(session logging)"]
+    EDITOR["<b>editor.rs</b><br/>(TextEditor state + ops)"]
     
     PROJECTS_TAB["<b>Projects Tab</b><br/>(table + tree + info)"]
     TOKENIZER_TAB["<b>Tokenizer Tab</b><br/>(status + actions)"]
     CLAUDEMD_TAB["<b>CLAUDE.md Tab</b><br/>(scrollable view + edit)"]
     RULES_TAB["<b>RULES Tab</b><br/>(list + preview + edit)"]
+    AGENTS_TAB["<b>Agents Tab</b><br/>(list + detail view)"]
+    INTRO_TAB["<b>Intro-Prompt Tab</b><br/>(editable template view)"]
     
     FZF_SEARCH["<b>FZF Search</b><br/>(/forward key)"]
     TOKENIZER_BIN["<b>tokenizer</b> binary<br/>(context optimizer)"]
@@ -31,11 +34,14 @@ flowchart TD
     TASKS_JSON["<b>~/.claude/progress/<br/>tasks.json</b><br/>(progress data)"]
     ARCH_MD["<b>ARCHITECTURE.md</b><br/>(runtime snapshot)"]
     DIGEST_MD["<b>context-digest.md</b><br/>(pre-launch snapshot)"]
+    AGENTS_REG_JSON["<b>~/.claude/agents/<br/>registry.json</b><br/>(agent catalogue)"]
     
     CLAUDEMD_GLOBAL["<b>~/.claude/CLAUDE.md</b><br/>(global rules)"]
     CLAUDEMD_PROJECT["<b>~/CLAUDE.md</b><br/>(project rules)"]
     RULES_STEMS["<b>~/.claude/rules/*.{md,toon}</b><br/>(rule files)"]
     TOKENIZER_MANIFEST["<b>tokenizer manifest.jsonl<br/>+ backups/</b><br/>(rule backups)"]
+    INTRO_TMPL_GLOBAL["<b>~/.claude/.projectwise/<br/>intro-prompt.tmpl</b><br/>(global template)"]
+    INTRO_TMPL_PROJECT["<b><project>/.projectwise/<br/>intro-prompt.tmpl</b><br/>(per-project override)"]
     EDIT_FILE["<b>edit_file_external</b><br/>($EDITOR suspend/resume)"]
     SAVE_RULE_EDIT["<b>save_rule_edit</b><br/>(write + roundtrip)"]
     
@@ -53,6 +59,8 @@ flowchart TD
     RUN_LIST_UI -->|render| TOKENIZER_TAB
     RUN_LIST_UI -->|render| CLAUDEMD_TAB
     RUN_LIST_UI -->|render| RULES_TAB
+    RUN_LIST_UI -->|render| AGENTS_TAB
+    RUN_LIST_UI -->|render| INTRO_TAB
     RUN_LIST_UI -->|loads| REG
     RUN_LIST_UI -->|loads| TASKS_JSON
     
@@ -64,6 +72,12 @@ flowchart TD
     CLAUDEMD_TAB -->|reads| CLAUDEMD_GLOBAL
     CLAUDEMD_TAB -->|reads| CLAUDEMD_PROJECT
     CLAUDEMD_TAB -->|edit| EDIT_FILE
+    
+    AGENTS_TAB -->|reads| AGENTS_REG_JSON
+    INTRO_TAB -->|reads| INTRO_TMPL_GLOBAL
+    INTRO_TAB -->|reads/writes| INTRO_TMPL_PROJECT
+    INTRO_TAB -->|uses| EDITOR
+    CLAUDEMD_TAB -->|uses| EDITOR
     
     RULES_TAB -->|lists| RULES_STEMS
     RULES_TAB -->|reads backup| TOKENIZER_MANIFEST
@@ -126,6 +140,9 @@ flowchart TD
     style TOKENIZER_TAB fill:#06B6D4,stroke:#0891B2,color:#000
     style CLAUDEMD_TAB fill:#06B6D4,stroke:#0891B2,color:#000
     style RULES_TAB fill:#06B6D4,stroke:#0891B2,color:#000
+    style AGENTS_TAB fill:#06B6D4,stroke:#0891B2,color:#000
+    style INTRO_TAB fill:#06B6D4,stroke:#0891B2,color:#000
+    style EDITOR fill:#0EA5E9,stroke:#0284C7,color:#000
     style FZF_SEARCH fill:#10B981,stroke:#059669,color:#fff
     style TOKENIZER_BIN fill:#10B981,stroke:#059669,color:#fff
     style CMD_PRELUNCH fill:#F59E0B,stroke:#D97706,color:#000
@@ -135,10 +152,13 @@ flowchart TD
     style TASKS_JSON fill:#EC4899,stroke:#BE185D,color:#fff
     style ARCH_MD fill:#EC4899,stroke:#BE185D,color:#fff
     style DIGEST_MD fill:#EC4899,stroke:#BE185D,color:#fff
+    style AGENTS_REG_JSON fill:#EC4899,stroke:#BE185D,color:#fff
     style CLAUDEMD_GLOBAL fill:#EC4899,stroke:#BE185D,color:#fff
     style CLAUDEMD_PROJECT fill:#EC4899,stroke:#BE185D,color:#fff
     style RULES_STEMS fill:#EC4899,stroke:#BE185D,color:#fff
     style TOKENIZER_MANIFEST fill:#EC4899,stroke:#BE185D,color:#fff
+    style INTRO_TMPL_GLOBAL fill:#EC4899,stroke:#BE185D,color:#fff
+    style INTRO_TMPL_PROJECT fill:#EC4899,stroke:#BE185D,color:#fff
     style EDIT_FILE fill:#F59E0B,stroke:#D97706,color:#000
     style SAVE_RULE_EDIT fill:#F59E0B,stroke:#D97706,color:#000
     style RULES_MD_MIRROR fill:#EC4899,stroke:#BE185D,color:#fff
@@ -166,10 +186,13 @@ flowchart TD
 - **run_list_ui** (`src/main.rs` lines 876+) — event loop for TUI; manages tab state (Projects/Tokenizer), selected row, focus, overlay, keybindings.
 - **Projects Tab** (`src/main.rs` render_projects_tab) — 3-panel layout: table (projects), filetree (right), info (far right); responsive to terminal width.
 - **Tokenizer Tab** (`src/main.rs` lines 681–748 render_tokenizer_tab) — displays status (binary/timer/hook) and action keys (o=optimize, T=full TUI, i=install timer, h=install hook).
-- **CLAUDE.md Tab** (`src/main.rs` render_text_tab) — scrollable view of CLAUDE.md; `g`/`p` toggle global vs. project CLAUDE.md; `e` edits via edit_file_external.
+- **CLAUDE.md Tab** (`src/main.rs` render_text_tab) — scrollable view of CLAUDE.md; `g`/`p` toggle global vs. project CLAUDE.md; `e` opens editor.rs for live editing with undo/redo/save.
 - **RULES Tab** (`src/main.rs` render_rules_tab) — lists rule stems from ~/.claude/rules, previews readability (prefer rules-md master, then live .md, tokenizer manifest backup, or best-effort decode); `e` edits master in rules-md via edit_file_external, then compile_rule_master recompiles to rules/*.toon and refreshes symlink.
+- **Agents Tab** (`src/main.rs` render_agents_tab) — loads and displays agent catalogue from ~/.claude/agents/registry.json; list + detail view mirrors PROGRESS.html Agents tab.
+- **Intro-Prompt Tab** (`src/main.rs` render_intro_tab) — editable template view; reads per-project override → global template → built-in default; uses editor.rs for live editing; saved templates are sourced by shell-init on project launch.
 - **filetree.rs** (`src/filetree.rs`) — FileTreeState widget; builds expandable directory tree for selected project's source.
 - **sessions.rs** (`src/sessions.rs`) — session logging; logs project access, session count, timestamps.
+- **editor.rs** (`src/editor.rs`) — self-contained UTF-8-aware multiline TextEditor state machine; used by CLAUDE.md tab and Intro-prompt tab for live editing; includes unit tests.
 - **FZF Search** (`src/main.rs` run_project_search + suspend_tui/resume_tui) — `/` key in TUI triggers fzf picker overlay; returns selected project folder.
 - **tokenizer binary** (`~/.cargo/bin/tokenizer`) — external optimizer; spawned on startup via spawn_tokenizer_optimize(), can run full TUI or one-shot optimize --quiet.
 - **cmd_pre_launch** (`src/main.rs` lines 1000+) — pre-launch orchestration: loads progress data, calls build_context_digest, logs session, returns digest path.
@@ -183,6 +206,9 @@ flowchart TD
 - **~/CLAUDE.md** (external store) — project-local rules; toggled via `g`/`p` in CLAUDE.md tab.
 - **~/.claude/rules/*.{md,toon}** (external store) — rule files; now strictly .toon (compiled); .md masters live in rules-md mirror with .toon symlinks.
 - **tokenizer manifest.jsonl + backups/** (external store) — tokenizer manifest and rule backups; used by RULES tab's rule_readable resolver for readability fallback.
+- **~/.claude/agents/registry.json** (external store) — flat JSON array (~145 agents); read by Agents Tab for list + detail rendering.
+- **~/.claude/.projectwise/intro-prompt.tmpl** (external store) — global Intro-Prompt template; fallback if per-project override missing; sourced by shell-init on project launch.
+- **<project>/.projectwise/intro-prompt.tmpl** (external store) — per-project Intro-Prompt override; editable via Intro-Prompt Tab; takes precedence over global template; sourced by shell-init on project launch.
 - **edit_file_external** (function) — spawns $EDITOR with suspend/resume for editing text files from within TUI.
 - **rules-md mirror** (`~/.claude/rules-md/`) — human-readable .md masters edited by RULES tab; each entry has a .toon symlink to live ~/.claude/rules/<stem>.toon managed by ensure_toon_symlink.
 - **cpm rules-sync** (`src/main.rs` rules_sync) — idempotent bootstrap subcommand: builds rules-md mirror, compiles .md-source rules to .toon and removes their .md, decodes .toon-only rules to readable masters. Also invoked backgrounded from shell wrapper projectwise() on each summon.
@@ -198,4 +224,5 @@ flowchart TD
 
 ## Change Log
 
+- 2026-06-16 · v3.8.0 (uncommitted) · added editor.rs TextEditor module, Agents Tab (reads ~/.claude/agents/registry.json), Intro-Prompt Tab + templates (global + per-project), TUI now 6 tabs (Projects, Tokenizer, CLAUDE.md, RULES, Agents, Intro).
 - 2026-06-14 · commit `90505fa` · tag v3.7.1 — merged PR #1: tabbed cockpit (Tokenizer/CLAUDE.md/RULES tabs), context-digest generator, rule .md↔.toon round-trip, rules/ now .toon-only, cpm rules-sync bootstrap, PROD hardening.

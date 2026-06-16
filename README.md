@@ -4,15 +4,15 @@
 
 **One small binary. Zero config. Every Claude Code project — and its governance — at your fingertips.**
 
-[![Version](https://img.shields.io/badge/version-3.7.1-blue?style=flat-square)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-3.8.0-blue?style=flat-square)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange?style=flat-square)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](package/LICENSE)
 [![Tests](https://img.shields.io/badge/tests-18%20passing-brightgreen?style=flat-square)](#testing)
 
 A Rust CLI/TUI that replaces fragile shell scripts with a fast, atomic,<br>
 interactive manager for Claude Code workspaces — now with a tabbed cockpit
-for projects, the Tokenizer optimizer, your global/project `CLAUDE.md`, and
-your `RULES`.
+for projects, the Tokenizer optimizer, your global/project `CLAUDE.md`,
+your `RULES`, the agent registry, and the Claude session intro prompt.
 
 </div>
 
@@ -40,12 +40,15 @@ session. Projectwise solves all of it:
 | Phantom deleted directories | Integrity checker detects and repairs mismatches |
 | Bloated `~/.claude` token cost | Bundled Tokenizer tab + auto-boost compress rules to `.toon` |
 | Governance files are hard to read/edit | Tabs for `CLAUDE.md` and `RULES`, with a readable `.md` ⇄ `.toon` round-trip |
+| Editing governance means leaving the TUI | In-TUI multiline editor (UTF-8 aware, `Ctrl+S` / `Esc`) for `CLAUDE.md` and the intro prompt — no `$EDITOR` shell-out |
+| Forgetting which agents you have | Agents tab mirrors the global registry (`~/.claude/agents/registry.json`) — searchable list + detail pane |
+| The session intro prompt was hardcoded | Intro tab externalizes it to an editable template (per-project / global / built-in default) |
 
 ---
 
-## Features (v3.7.1)
+## Features (v3.8.0)
 
-**Tabbed TUI cockpit** — switch with `[` / `]` or `1`–`4`:
+**Tabbed TUI cockpit** — switch with `[` / `]` or `1`–`6`:
 
 1. **Projects** — 3-panel layout (list + directory tree + info), 40 opaline
    themes (`t`), mouse support, dashboard (`d`), and `/` fuzzy search over
@@ -55,11 +58,25 @@ session. Projectwise solves all of it:
    optimize (`o`), open the full Tokenizer TUI (`T`), install timer (`i`) /
    hook (`h`). Tokenizer is also auto-installed + boosted on every summon.
 3. **CLAUDE.md** — view/scroll your **global** (`~/.claude/CLAUDE.md`) and
-   **project** (`~/CLAUDE.md`) instructions; toggle with `g` / `p`, edit in
-   `$EDITOR` with `e`.
+   **project** (`~/CLAUDE.md`) instructions; toggle with `g` / `p`, and `e`
+   opens a true **in-TUI multiline editor** (UTF-8 aware, `Ctrl+S` save /
+   `Esc` cancel with an unsaved-changes guard) — no more shelling out to
+   `$EDITOR`.
 4. **RULES** — browse every rule in `~/.claude/rules/` rendered **human-readable**,
    and edit it (`e`). Edits go to a readable `.md` master in `~/.claude/rules-md/`
    and are recompiled back to the token-optimized `.toon` that Claude loads.
+5. **Agents** — read-only view of the global agent registry
+   (`~/.claude/agents/registry.json`, ~145 agents). Scrollable list (id + name)
+   on the left, detail pane on the right (alias, industry, framework, skillset,
+   use case, source URL) — mirrors the PROGRESS.html Agents view. `j`/`k`
+   select; PgUp/PgDn scroll the detail pane.
+6. **Intro** — view/edit the Claude **session intro prompt**, now externalized
+   from shell-init to an editable template. Resolution order at launch:
+   per-project `<project>/.projectwise/intro-prompt.tmpl` → global
+   `~/.claude/.projectwise/intro-prompt.tmpl` → built-in default. `g`/`p`
+   switch between the global template and the selected project's override; `e`
+   opens the same in-TUI editor; `j`/`k` scroll. The global template is seeded
+   with the default text on first edit.
 
 **Context absorption** — on launch, Projectwise writes a `context-digest.md`
 (latest PROGRESS pulled from `~/.claude/progress/tasks.json` + `ARCHITECTURE.md`)
@@ -134,7 +151,7 @@ cpm select all       # include archived projects
 ### Interactive cockpit
 
 ```bash
-cpm list              # tabbed Ratatui TUI (Projects · Tokenizer · CLAUDE.md · RULES)
+cpm list              # tabbed Ratatui TUI (Projects · Tokenizer · CLAUDE.md · RULES · Agents · Intro)
 cpm list favorite     # favorites only
 cpm list all          # including archived
 ```
@@ -143,15 +160,17 @@ cpm list all          # including archived
 
 | Key | Action |
 |-----|--------|
-| `[` / `]` or `1`–`4` | Switch tab |
+| `[` / `]` or `1`–`6` | Switch tab |
 | `j`/`k` or arrows | Navigate / scroll |
 | `/` | Fuzzy-search project folders (Projects tab) |
 | `Enter` | Select and enter project |
 | `t` | Cycle 40 opaline themes |
 | `r` / `x`·`Del` | Rename / delete project (Projects tab) |
 | `d` | Dashboard (heatmap, charts, sparkline) |
-| `g` / `p` | Global / project file (CLAUDE.md tab) |
-| `e` | Edit current file in `$EDITOR` (CLAUDE.md / RULES tabs) |
+| `g` / `p` | Global / project file (CLAUDE.md tab) · global template / project override (Intro tab) |
+| `e` | Edit current file in the in-TUI editor (CLAUDE.md / Intro tabs); RULES still edits the readable `.md` master |
+| `Ctrl+S` / `Esc` | Save / cancel in the in-TUI editor (`Esc` guards unsaved changes) |
+| PgUp / PgDn | Scroll the detail pane (Agents tab) |
 | `o` `T` `i` `h` | Optimize / open TUI / install timer / install hook (Tokenizer tab) |
 | Mouse / scroll | Select / navigate |
 | `q` / `Esc` | Quit |
@@ -220,7 +239,7 @@ block. Missing tools are silently skipped (`cmd_exists()` gate).
 | `TOKENIZER_BIN` | `~/.cargo/bin/tokenizer` | Tokenizer binary |
 | `MD_TO_JSON_BIN` | `~/.local/bin/md_to_json` | Markdown→JSON converter |
 | `TOON_BIN` | (PATH / newest nvm) | TOON encoder CLI |
-| `VISUAL` / `EDITOR` | `vi` | Editor for the CLAUDE.md / RULES tabs |
+| `VISUAL` / `EDITOR` | `vi` | External editor for the RULES master (CLAUDE.md / Intro tabs use the built-in in-TUI editor) |
 
 ---
 
@@ -233,6 +252,7 @@ src/
 ├── registry.rs   # CRUD, atomic writes (tempfile → rename), backup rotation
 ├── sessions.rs   # session logging + activity stats (dashboard)
 ├── filetree.rs   # directory-tree widget (Projects tab)
+├── editor.rs     # in-TUI multiline text editor (UTF-8 aware; CLAUDE.md + Intro tabs)
 └── theme.rs      # 40 opaline themes with live switching
 ```
 
@@ -271,6 +291,19 @@ a manual smoke pass.
 ---
 
 ## Changelog
+
+### v3.8.0
+**Agents tab** (5) — read-only view of the global agent registry
+(`~/.claude/agents/registry.json`, ~145 agents): scrollable id+name list with a
+detail pane (alias, industry, framework, skillset, use case, source URL),
+mirroring the PROGRESS.html Agents view. **Intro tab** (6) — the Claude session
+intro prompt is externalized from shell-init to an editable template
+(per-project override → global → built-in default); `g`/`p` switch global vs the
+selected project's override, `e` edits, global is seeded on first edit.
+**In-TUI editor** — the CLAUDE.md and Intro tabs' `e` now opens a true in-TUI
+multiline text editor (new `src/editor.rs`, UTF-8 aware, `Ctrl+S` save / `Esc`
+cancel with unsaved-changes guard) instead of shelling out to `$EDITOR`. Tabs
+are now Projects · Tokenizer · CLAUDE.md · RULES · Agents · Intro (`1`–`6`).
 
 ### v3.7.1
 PROD hardening: panic fixes (home-dir fallbacks, multibyte cursor, picker

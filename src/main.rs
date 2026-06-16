@@ -1,3 +1,4 @@
+mod editor;
 mod filetree;
 mod models;
 mod registry;
@@ -75,7 +76,7 @@ fn get_home() -> PathBuf {
 #[derive(Parser)]
 #[command(
     name = "cpm",
-    version = "3.7.1",
+    version = "3.8.0",
     about = "Projectwise — TUI project manager for Claude Code"
 )]
 struct Cli {
@@ -242,7 +243,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Version) => {
-            println!("Projectwise v3.7.1");
+            println!("Projectwise v3.8.0");
             Ok(())
         }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
@@ -607,6 +608,8 @@ enum Tab {
     Tokenizer,
     ClaudeMd,
     Rules,
+    Agents,
+    IntroPrompt,
 }
 
 impl Tab {
@@ -615,15 +618,19 @@ impl Tab {
             Tab::Projects => Tab::Tokenizer,
             Tab::Tokenizer => Tab::ClaudeMd,
             Tab::ClaudeMd => Tab::Rules,
-            Tab::Rules => Tab::Projects,
+            Tab::Rules => Tab::Agents,
+            Tab::Agents => Tab::IntroPrompt,
+            Tab::IntroPrompt => Tab::Projects,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Tab::Projects => Tab::Rules,
+            Tab::Projects => Tab::IntroPrompt,
             Tab::Tokenizer => Tab::Projects,
             Tab::ClaudeMd => Tab::Tokenizer,
             Tab::Rules => Tab::ClaudeMd,
+            Tab::Agents => Tab::Rules,
+            Tab::IntroPrompt => Tab::Agents,
         }
     }
     fn index(self) -> usize {
@@ -632,6 +639,8 @@ impl Tab {
             Tab::Tokenizer => 1,
             Tab::ClaudeMd => 2,
             Tab::Rules => 3,
+            Tab::Agents => 4,
+            Tab::IntroPrompt => 5,
         }
     }
 }
@@ -888,6 +897,35 @@ fn claude_md_global_path() -> PathBuf {
 
 fn claude_md_project_path() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join("CLAUDE.md")
+}
+
+/// Global session intro-prompt template. shell-init reads this (per-project
+/// override first, then this global default, then a hardcoded fallback).
+fn intro_tmpl_global_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude/.projectwise/intro-prompt.tmpl")
+}
+
+/// Per-project intro-prompt override inside a project's `.projectwise/` dir.
+fn intro_tmpl_project_path(project_dir: &std::path::Path) -> PathBuf {
+    project_dir.join(".projectwise/intro-prompt.tmpl")
+}
+
+/// The hardcoded default intro prompt — kept in sync with the shell-init
+/// fallback so a fresh global template seeds with the canonical text.
+const INTRO_PROMPT_DEFAULT: &str = "Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed.";
+
+/// Seed the global intro template with the default text if it does not exist.
+fn ensure_intro_global() -> PathBuf {
+    let p = intro_tmpl_global_path();
+    if !p.exists() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, INTRO_PROMPT_DEFAULT);
+    }
+    p
 }
 
 fn rules_dir() -> PathBuf {
@@ -1353,6 +1391,213 @@ fn render_rules_tab(
     f.render_widget(p, chunks[1]);
 }
 
+// ── Agents tab ───────────────────────────────────────────────────────
+
+/// A flattened registry agent (mirrors the fields PROGRESS.html shows).
+#[derive(Clone, Default)]
+struct AgentEntry {
+    id: i64,
+    name: String,
+    alias: String,
+    industry: String,
+    framework: String,
+    skillset: String,
+    use_case: String,
+    source_url: String,
+}
+
+fn agents_registry_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude/agents/registry.json")
+}
+
+/// Load the agent catalogue from ~/.claude/agents/registry.json (a flat JSON
+/// array). Fail-open: returns an empty vec if missing/unparseable.
+fn load_agents() -> Vec<AgentEntry> {
+    let content = match std::fs::read_to_string(agents_registry_path()) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|v| {
+            let skillset = v["skillset"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            AgentEntry {
+                id: v["id"].as_i64().unwrap_or(0),
+                name: v["name"].as_str().unwrap_or("").to_string(),
+                alias: v["alias"].as_str().unwrap_or("").to_string(),
+                industry: v["industry"].as_str().unwrap_or("").to_string(),
+                framework: v["framework"].as_str().unwrap_or("").to_string(),
+                skillset,
+                use_case: v["useCase"].as_str().unwrap_or("").to_string(),
+                source_url: v["sourceUrl"].as_str().unwrap_or("").to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Render the Agents tab: scrollable agent list (left) + detail pane (right),
+/// mirroring the PROGRESS.html Agents view.
+fn render_agents_tab(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    agents: &[AgentEntry],
+    selected: usize,
+    scroll: u16,
+) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(34), Constraint::Min(20)])
+        .split(area);
+
+    // Left: list with a scroll window around the selection.
+    let h = chunks[0].height.saturating_sub(2) as usize;
+    let top = if h > 0 && selected >= h { selected + 1 - h } else { 0 };
+    let items: Vec<ListItem> = agents
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(h.max(1))
+        .map(|(i, a)| {
+            let style = if i == selected {
+                Style::default().bg(theme::accent()).fg(theme::bg())
+            } else {
+                theme::row_normal()
+            };
+            ListItem::new(format!("{} {}", a.id, a.name)).style(style)
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border())
+            .title(format!(" Agents ({}) ", agents.len()))
+            .title_style(theme::title()),
+    );
+    f.render_widget(list, chunks[0]);
+
+    // Right: detail of the selected agent.
+    let detail = match agents.get(selected) {
+        Some(a) => format!(
+            "{}  (#{} · {})\n\nAlias:     {}\nIndustry:  {}\nFramework: {}\n\nSkillset:\n  {}\n\nUse case:\n  {}\n\nSource:\n  {}",
+            a.name, a.id, a.framework, a.alias, a.industry, a.framework, a.skillset, a.use_case, a.source_url
+        ),
+        None => "(no agents found in ~/.claude/agents/registry.json)".to_string(),
+    };
+    let title = match agents.get(selected) {
+        Some(_) => " Agent detail  \u{2014}  j/k:select  PgUp/PgDn:scroll ".to_string(),
+        None => " Agents ".to_string(),
+    };
+    let p = Paragraph::new(detail)
+        .style(theme::row_normal())
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme::border())
+                .title(title)
+                .title_style(theme::title()),
+        );
+    f.render_widget(p, chunks[1]);
+}
+
+/// Full-screen in-TUI multiline editor modal. Returns Ok(true) if the user
+/// saved (Ctrl+S), Ok(false) if they cancelled. Creates parent dirs on save.
+fn run_editor<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    title: &str,
+    path: &std::path::Path,
+) -> Result<bool> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    let initial = std::fs::read_to_string(path).unwrap_or_default();
+    let mut ed = editor::TextEditor::from_str(&initial);
+    let mut status = format!("editing {}", path.display());
+    let mut pending_discard = false;
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let head = format!(
+                "{title}  \u{2014}  Ctrl+S:save  Esc:cancel{}",
+                if ed.dirty { "  \u{25cf} unsaved" } else { "" }
+            );
+            ed.render(
+                f,
+                area,
+                &head,
+                &status,
+                theme::border(),
+                theme::title(),
+                theme::row_normal(),
+            );
+        })?;
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Char('s') if ctrl => {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::write(path, ed.to_string()) {
+                            Ok(()) => return Ok(true),
+                            Err(e) => status = format!("save failed: {e}"),
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if !ed.dirty || pending_discard {
+                            return Ok(false);
+                        }
+                        pending_discard = true;
+                        status = "Unsaved changes — Esc again to discard, Ctrl+S to save".to_string();
+                        continue;
+                    }
+                    KeyCode::Enter => ed.insert_newline(),
+                    KeyCode::Backspace => ed.backspace(),
+                    KeyCode::Delete => ed.delete(),
+                    KeyCode::Left => ed.left(),
+                    KeyCode::Right => ed.right(),
+                    KeyCode::Up => ed.up(),
+                    KeyCode::Down => ed.down(),
+                    KeyCode::Home => ed.home(),
+                    KeyCode::End => ed.end(),
+                    KeyCode::PageUp => ed.page_up(10),
+                    KeyCode::PageDown => ed.page_down(10),
+                    KeyCode::Tab => {
+                        for _ in 0..2 {
+                            ed.insert_char(' ');
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl => ed.insert_char(c),
+                    _ => {}
+                }
+                pending_discard = false;
+            }
+        }
+    }
+}
+
 // ── Overlay states ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1419,6 +1664,13 @@ fn run_list_ui<W: std::io::Write>(
     let mut rule_scroll: u16 = 0;
     let mut rule_cache: Option<(String, Option<RuleFormat>)> = None;
     let mut rule_compile_status: Option<String> = None;
+    // Agents tab state (registry loaded once).
+    let agents = load_agents();
+    let mut agent_sel: usize = 0;
+    let mut agent_scroll: u16 = 0;
+    // Intro-prompt tab state: true = global template, false = selected project.
+    let mut intro_global = true;
+    let mut intro_scroll: u16 = 0;
 
     // Stored panel areas for mouse hit-testing
     let mut table_area = Rect::default();
@@ -1456,9 +1708,45 @@ fn run_list_ui<W: std::io::Write>(
             format!("(no file at {})", claude_path.display())
         });
         let claude_title = if claude_md_global {
-            "CLAUDE.md [global ~/.claude]  —  g/p:switch  e:edit  j/k:scroll"
+            "CLAUDE.md [global ~/.claude]  —  g/p:switch  e:edit (in-TUI)  j/k:scroll"
         } else {
-            "CLAUDE.md [project ~/]  —  g/p:switch  e:edit  j/k:scroll"
+            "CLAUDE.md [project ~/]  —  g/p:switch  e:edit (in-TUI)  j/k:scroll"
+        };
+
+        // Intro-prompt tab body (read fresh each frame). Global template, or the
+        // currently-selected project's override; falls back to the default text.
+        let intro_project_dir = selected
+            .checked_sub(virtual_count)
+            .and_then(|i| projects.get(i))
+            .map(|p| home.join(&p.folder_name));
+        let intro_path = if intro_global {
+            intro_tmpl_global_path()
+        } else {
+            match &intro_project_dir {
+                Some(d) => intro_tmpl_project_path(d),
+                None => intro_tmpl_global_path(),
+            }
+        };
+        let intro_body = match std::fs::read_to_string(&intro_path) {
+            Ok(s) => s,
+            Err(_) if intro_global => format!(
+                "(no global template yet — press e to create it)\n\nDefault that ships in shell-init:\n\n{INTRO_PROMPT_DEFAULT}"
+            ),
+            Err(_) => format!(
+                "(no per-project override at {})\n\nThis project falls back to the global template, then the built-in default. Press e to create a project-specific intro prompt.",
+                intro_path.display()
+            ),
+        };
+        let intro_title = if intro_global {
+            "Intro prompt [global]  —  g/p:global/project  e:edit (in-TUI)  j/k:scroll".to_string()
+        } else {
+            match &intro_project_dir {
+                Some(d) => format!(
+                    "Intro prompt [project: {}]  —  g/p:global/project  e:edit  j/k:scroll",
+                    d.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+                ),
+                None => "Intro prompt [no project selected — showing global]".to_string(),
+            }
         };
 
         // RULES tab preview (lazily cached; invalidated on selection change).
@@ -1520,6 +1808,8 @@ fn run_list_ui<W: std::io::Write>(
                 Line::from(" 2 Tokenizer "),
                 Line::from(" 3 CLAUDE.md "),
                 Line::from(" 4 RULES "),
+                Line::from(" 5 Agents "),
+                Line::from(" 6 Intro "),
             ])
             .select(active_tab.index())
             .style(theme::dim())
@@ -1571,6 +1861,10 @@ fn run_list_ui<W: std::io::Write>(
                     rule_fmt,
                     rule_scroll,
                 );
+            } else if active_tab == Tab::Agents {
+                render_agents_tab(f, tok_content_area, &agents, agent_sel, agent_scroll);
+            } else if active_tab == Tab::IntroPrompt {
+                render_text_tab(f, tok_content_area, &intro_title, &intro_body, intro_scroll);
             } else {
             // Table (panel index 1)
             table_area = vertical_chunks[1];
@@ -1819,6 +2113,10 @@ fn run_list_ui<W: std::io::Write>(
                 " q:Quit  [ ]:Switch tab  g/p:Global/Project  e:Edit  j/k:Scroll"
             } else if active_tab == Tab::Rules {
                 " q:Quit  [ ]:Switch tab  j/k:Select  e:Edit  PgUp/PgDn:Scroll"
+            } else if active_tab == Tab::Agents {
+                " q:Quit  [ ]:Switch tab  j/k:Select  PgUp/PgDn:Scroll detail"
+            } else if active_tab == Tab::IntroPrompt {
+                " q:Quit  [ ]:Switch tab  g/p:Global/Project  e:Edit (in-TUI)  j/k:Scroll"
             } else if show_tree {
                 " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
             } else {
@@ -1866,6 +2164,8 @@ fn run_list_ui<W: std::io::Write>(
                         KeyCode::Char('2') => active_tab = Tab::Tokenizer,
                         KeyCode::Char('3') => active_tab = Tab::ClaudeMd,
                         KeyCode::Char('4') => active_tab = Tab::Rules,
+                        KeyCode::Char('5') => active_tab = Tab::Agents,
+                        KeyCode::Char('6') => active_tab = Tab::IntroPrompt,
                         KeyCode::Char('/') if active_tab == Tab::Projects => {
                             if let Some(folder) = run_project_search(terminal, home)? {
                                 if let Some(idx) =
@@ -1915,7 +2215,13 @@ fn run_list_ui<W: std::io::Write>(
                             } else {
                                 claude_md_project_path()
                             };
-                            edit_file_external(terminal, &path)?;
+                            let title = if claude_md_global {
+                                "CLAUDE.md (global ~/.claude)"
+                            } else {
+                                "CLAUDE.md (project ~/)"
+                            };
+                            run_editor(terminal, title, &path)?;
+                            claude_scroll = 0;
                         }
                         KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::ClaudeMd => {
                             claude_scroll = claude_scroll.saturating_add(1);
@@ -1976,6 +2282,61 @@ fn run_list_ui<W: std::io::Write>(
                         }
                         KeyCode::PageUp if active_tab == Tab::Rules => {
                             rule_scroll = rule_scroll.saturating_sub(10);
+                        }
+                        // ── Agents tab ──
+                        KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::Agents => {
+                            if !agents.is_empty() {
+                                agent_sel = (agent_sel + 1) % agents.len();
+                                agent_scroll = 0;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up if active_tab == Tab::Agents => {
+                            if !agents.is_empty() {
+                                agent_sel = (agent_sel + agents.len() - 1) % agents.len();
+                                agent_scroll = 0;
+                            }
+                        }
+                        KeyCode::PageDown if active_tab == Tab::Agents => {
+                            agent_scroll = agent_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp if active_tab == Tab::Agents => {
+                            agent_scroll = agent_scroll.saturating_sub(10);
+                        }
+                        // ── Intro-prompt tab ──
+                        KeyCode::Char('g') if active_tab == Tab::IntroPrompt => {
+                            intro_global = true;
+                            intro_scroll = 0;
+                        }
+                        KeyCode::Char('p') if active_tab == Tab::IntroPrompt => {
+                            intro_global = false;
+                            intro_scroll = 0;
+                        }
+                        KeyCode::Char('e') if active_tab == Tab::IntroPrompt => {
+                            let path = if intro_global {
+                                ensure_intro_global()
+                            } else {
+                                match selected
+                                    .checked_sub(virtual_count)
+                                    .and_then(|i| projects.get(i))
+                                    .map(|p| home.join(&p.folder_name))
+                                {
+                                    Some(d) => intro_tmpl_project_path(&d),
+                                    None => ensure_intro_global(),
+                                }
+                            };
+                            let title = if intro_global {
+                                "Intro prompt (global)".to_string()
+                            } else {
+                                "Intro prompt (project override)".to_string()
+                            };
+                            run_editor(terminal, &title, &path)?;
+                            intro_scroll = 0;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down if active_tab == Tab::IntroPrompt => {
+                            intro_scroll = intro_scroll.saturating_add(1);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up if active_tab == Tab::IntroPrompt => {
+                            intro_scroll = intro_scroll.saturating_sub(1);
                         }
                         KeyCode::Tab => {
                             focus = focus.next();
@@ -3362,7 +3723,7 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 fn cmd_shell_init() -> Result<()> {
     print!(
         r#"# Projectwise — shell integration
-# Generated by cpm shell-init v3.7.1
+# Generated by cpm shell-init v3.8.0
 
 # Ensure Tokenizer is installed (once) and fire a background boost so Claude
 # starts with freshly-compressed .toon context. Fail-open: never blocks launch.
@@ -3382,7 +3743,16 @@ _projectwise_tokenizer() {{
 _projectwise_launch() {{
   local _dir="$1"; shift
   local _digest="$_dir/.projectwise/context-digest.md"
-  local _interview="Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed."
+  # Intro prompt template: per-project override → global default → built-in.
+  # Edit either via Projectwise's Intro tab (key 6).
+  local _interview
+  if [[ -s "$_dir/.projectwise/intro-prompt.tmpl" ]]; then
+    _interview="$(cat "$_dir/.projectwise/intro-prompt.tmpl")"
+  elif [[ -s "$HOME/.claude/.projectwise/intro-prompt.tmpl" ]]; then
+    _interview="$(cat "$HOME/.claude/.projectwise/intro-prompt.tmpl")"
+  else
+    _interview="Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed."
+  fi
   if [[ -s "$_digest" ]]; then
     command claude --dangerously-skip-permissions "$_interview Then read the file $_digest -- it is the latest PROGRESS + ARCHITECTURE snapshot for this project; absorb it before interviewing me." "$@"
   else
@@ -3865,10 +4235,14 @@ mod tab_tests {
     #[test]
     fn tab_cycle_next_prev() {
         assert_eq!(Tab::Projects.next(), Tab::Tokenizer);
-        assert_eq!(Tab::Rules.next(), Tab::Projects);
-        assert_eq!(Tab::Projects.prev(), Tab::Rules);
+        assert_eq!(Tab::Rules.next(), Tab::Agents);
+        assert_eq!(Tab::Agents.next(), Tab::IntroPrompt);
+        assert_eq!(Tab::IntroPrompt.next(), Tab::Projects);
+        assert_eq!(Tab::Projects.prev(), Tab::IntroPrompt);
         assert_eq!(Tab::Tokenizer.prev(), Tab::Projects);
         assert_eq!(Tab::ClaudeMd.index(), 2);
+        assert_eq!(Tab::Agents.index(), 4);
+        assert_eq!(Tab::IntroPrompt.index(), 5);
     }
 
     #[test]

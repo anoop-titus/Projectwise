@@ -1,5 +1,18 @@
 # Projectwise — Progress Log
 
+## v3.8.0 — 2026-06-16 — Agents tab, intro-prompt template + in-TUI editor
+
+Three features (version 3.7.1 → 3.8.0 in `Cargo.toml` + CLI/banner); tab set grows 4 → 6:
+
+1. **Agents tab (tab 5 / key `5`)** — new `render_agents_tab` reads the global agent registry (`~/.claude/agents/registry.json`, a flat array of ~145 agents). Scrollable id+name list on the left, detail pane on the right (alias, industry, framework, skillset, use case, source URL), mirroring the PROGRESS.html Agents view. Read-only: `j`/`k` select, PgUp/PgDn scroll the detail pane.
+2. **Intro-prompt editor tab (tab 6 / key `6`)** — the Claude session intro prompt (previously hardcoded in shell-init) is externalized to an editable template file. Resolution order at launch: per-project `<project>/.projectwise/intro-prompt.tmpl` → global `~/.claude/.projectwise/intro-prompt.tmpl` → built-in default. `g`/`p` switch between the global template and the selected project's override; `e` opens the in-TUI editor; `j`/`k` scroll. The global template is seeded with the default text on first edit.
+3. **In-TUI CLAUDE.md editing** — the CLAUDE.md tab's `e` now opens a true in-TUI multiline text editor (new `src/editor.rs` module: UTF-8 aware, `Ctrl+S` save / `Esc` cancel with an unsaved-changes guard) instead of shelling out to `$EDITOR`. The same `editor.rs` module backs the Intro tab.
+
+- **Tabs are now:** 1 Projects · 2 Tokenizer · 3 CLAUDE.md · 4 RULES · 5 Agents · 6 Intro (switch with `[`/`]` or `1`–`6`).
+- **Per-project tasks.json migration — no cpm change required:** confirmed cpm reads the aggregate `~/.claude/progress/tasks.json`, which is kept in legacy shape, so the separate per-project tasks.json migration needed no code change here.
+
+**Docs:** README.md updated — version badge 3.7.1 → 3.8.0, tagline/why-table/features rows for the two new tabs + in-TUI editor, tab list (`1`–`6`) everywhere it appears, keybindings table (`Ctrl+S`/`Esc`, PgUp/PgDn, revised `g`/`p` + `e`), `src/` tree gains `editor.rs`, Configuration `$EDITOR` note, new v3.8.0 changelog entry.
+
 ## v3.7.1 — 2026-06-14 — PROD hardening (code review + E2E)
 
 Code-architecture-reviewer pass + full E2E/unit sweep ahead of PROD.
@@ -44,3 +57,14 @@ Three features added (all in `src/main.rs`, version bumped 3.4.0 → 3.5.0 in `C
 3. **Auto-absorb PROGRESS + ARCHITECTURE** — `build_context_digest` (+ `strip_html`) writes `<project>/.projectwise/context-digest.md` from `~/.claude/progress/tasks.json` (clean structured progress; PROGRESS.md/PROGRESS.html fallback) plus `ARCHITECTURE.md`. `cmd_pre_launch` builds it non-interactively (replacing the old `less` "Review docs?" prompt); `cmd_shell_init`'s `_projectwise_launch` passes the digest to `claude` as the initial prompt.
 
 **Verification:** `cargo build --release` clean; `cargo clippy` 0 errors (2 pre-existing warnings in registry.rs/sessions.rs); `cargo test` 7/7 pass. Digest generation confirmed on `Tokenizer_1779847795` (progress) and `SOCKS5-Brave_1779094066` (progress + architecture). `cpm version` → 3.5.0; `cpm shell-init` emits the tokenizer bootstrap + digest-injection wrapper. Binary installed to `~/.local/bin/cpm`.
+
+---
+
+## Scribe task log (append-only)
+
+`2026-06-14` · task `pw-v3.5.0` · `v3.5.0 — In-TUI fzf search, Tokenizer tab, context digest` · `done` · commit `90505fa` (PR #1)
+`2026-06-14` · task `pw-v3.6.0` · `v3.6.0 — CLAUDE.md + RULES tabs, global rules, interview prompt` · `done` · commit `90505fa` (PR #1)
+`2026-06-14` · task `pw-v3.7.0` · `v3.7.0 — Readable .md rule mirror + .toon round-trip` · `done` · commit `90505fa` (PR #1)
+`2026-06-14` · task `pw-v3.7.1` · `v3.7.1 — PROD hardening (code review + E2E)` · `done` · commit `90505fa`; merged `7c9abe2`; finalize `67b4ae2`
+`2026-06-14` · task `pw-release-v3.7.1` · `Release + install — README, CI, install, PR merge, tag v3.7.1` · `done` · commit `7c9abe2` (merge PR #1), tag `v3.7.1` at `67b4ae2`
+`2026-06-16` · task `pw-v3.8.0` · `v3.8.0 — Agents tab, intro-prompt template + in-TUI editor (src/editor.rs)` · `done`
