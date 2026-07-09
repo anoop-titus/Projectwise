@@ -119,6 +119,8 @@ impl RegistryManager {
                 git_link: None,
                 favorite: false,
                 archive_path: None,
+                model: crate::models::default_model(),
+                effort: String::new(),
             });
             Ok(())
         })
@@ -171,6 +173,8 @@ impl RegistryManager {
                 "description" => project.description = value.clone(),
                 "category" => project.category = value.clone(),
                 "status" => project.status = value.parse()?,
+                "model" => project.model = value.clone(),
+                "effort" => project.effort = value.clone(),
                 "git_link" => {
                     project.git_link = if value.is_empty() {
                         None

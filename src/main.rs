@@ -76,7 +76,7 @@ fn get_home() -> PathBuf {
 #[derive(Parser)]
 #[command(
     name = "cpm",
-    version = "3.8.0",
+    version = "3.9.0",
     about = "Projectwise — TUI project manager for Claude Code"
 )]
 struct Cli {
@@ -123,7 +123,7 @@ enum Commands {
         #[command(subcommand)]
         sub: RegistrySub,
     },
-    /// Pre-launch hooks (axon, tldr, integrity)
+    /// Pre-launch hooks (axon, tlrc, integrity)
     PreLaunch { folder: String },
     /// Check registry/filesystem integrity
     Integrity {
@@ -147,6 +147,13 @@ enum Commands {
     /// [internal] Single-line input prompt for FZF keybindings
     #[command(name = "_prompt-input")]
     PromptInput { label: String },
+    /// [internal] Emit resolved session-start launch flags (model/effort) for a
+    /// project as an eval-able bash array; consumed by the shell integration.
+    #[command(name = "launch-args")]
+    LaunchArgs { folder: String },
+    /// Install/refresh the Projectwise SessionEnd handoff hook (idempotent).
+    #[command(name = "install-hooks")]
+    InstallHooks,
 }
 
 #[derive(Subcommand)]
@@ -243,11 +250,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Version) => {
-            println!("Projectwise v3.8.0");
+            println!("Projectwise v3.9.0");
             Ok(())
         }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
         Some(Commands::PromptInput { label }) => cmd_prompt_input(&label),
+        Some(Commands::LaunchArgs { folder }) => cmd_launch_args(&mgr, &folder),
+        Some(Commands::InstallHooks) => cmd_install_hooks(&home),
         Some(Commands::PreLaunch { folder }) => cmd_pre_launch(&mgr, &home, &folder),
         Some(Commands::Create) => cmd_create(&mgr, &home),
         Some(Commands::Edit { folder }) => cmd_edit(&mgr, &folder),
@@ -496,6 +505,18 @@ fn build_context_digest(
 
     let mut has_content = false;
 
+    // ⏭ Surface the last session's consolidated handoff FIRST — the
+    // "where we left off + next steps to 100%" note written by the SessionEnd
+    // Haiku pass. Kept in its own file so it survives this digest rebuild.
+    if let Ok(handoff) = std::fs::read_to_string(dir.join(".projectwise/session-handoff.md")) {
+        if !handoff.trim().is_empty() {
+            out.push_str("## \u{23ed} Where we left off (last session)\n\n");
+            out.push_str(handoff.trim());
+            out.push_str("\n\n");
+            has_content = true;
+        }
+    }
+
     // Progress from ~/.claude/progress/tasks.json (authoritative source).
     let task_entry = home
         .parent()
@@ -581,6 +602,108 @@ fn progress_url_cell(repo_path: &str) -> String {
         .unwrap_or_else(|| repo_path.to_string());
     let indicator = if exists { "\u{2713}" } else { "\u{00b7}" };
     format!("{indicator} {short}/PROGRESS.html")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Model / Effort — per-project session-start configuration
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The `claude` CLI accepts `--model <alias>` and `--effort <low|medium|high|
+// xhigh|max>`. "ultracode" is NOT a CLI effort value — it is `--effort xhigh`
+// plus the dynamic-workflow trigger keyword. Sonnet 5 and Fable 5 ship a native
+// 1M-token context window; Opus needs the explicit `[1m]` suffix for 1M context.
+
+/// Model dropdown options: (stored value == `--model` CLI value, display label).
+/// The stored value is exactly what gets passed to `--model`; the label is what
+/// the table and picker show. Empty/unknown resolves to the first entry.
+const MODEL_OPTIONS: [(&str, &str); 5] = [
+    ("sonnet", "Sonnet 5"),
+    ("opus", "Opus 4.8"),
+    ("opus[1m]", "Opus 4.8\u{00b7}1M"),
+    ("haiku", "Haiku 4.5"),
+    ("fable", "Fable 5"),
+];
+
+/// Effort dropdown options: (stored value, display label). Empty value means
+/// "Default (inherit)" — no `--effort` flag is passed. "ultracode" resolves to
+/// `--effort xhigh` plus a dynamic-workflow keyword injected into the prompt.
+const EFFORT_OPTIONS: [(&str, &str); 7] = [
+    ("", "Default"),
+    ("low", "low"),
+    ("medium", "medium"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+    ("max", "max"),
+    ("ultracode", "ultracode"),
+];
+
+/// Human-readable label for a stored model value (falls back to the raw value,
+/// and to Sonnet 5 for empty — the effective default).
+fn model_label(value: &str) -> String {
+    if value.trim().is_empty() {
+        return MODEL_OPTIONS[0].1.to_string();
+    }
+    MODEL_OPTIONS
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, l)| l.to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// Index into `MODEL_OPTIONS` for a stored model value (0 = Sonnet 5 default).
+fn model_option_index(value: &str) -> usize {
+    MODEL_OPTIONS.iter().position(|(v, _)| *v == value).unwrap_or(0)
+}
+
+/// Index into `EFFORT_OPTIONS` for a stored effort value (0 = Default/inherit).
+fn effort_option_index(value: &str) -> usize {
+    EFFORT_OPTIONS.iter().position(|(v, _)| *v == value).unwrap_or(0)
+}
+
+/// Human-readable label for a stored effort value ("Default" for empty — the
+/// same label the picker shows, via EFFORT_OPTIONS[0]).
+fn effort_label(value: &str) -> String {
+    if value.trim().is_empty() {
+        return EFFORT_OPTIONS[0].1.to_string();
+    }
+    EFFORT_OPTIONS
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, l)| l.to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// Resolve a stored (model, effort) pair into the `claude` launch argv flags and
+/// an `ultracode` flag. Model is ALWAYS emitted (unset ⇒ "sonnet"); effort is
+/// emitted only when a level is chosen; "ultracode" ⇒ `--effort xhigh` + true.
+fn resolve_launch_flags(model: &str, effort: &str) -> (Vec<String>, bool) {
+    let mut flags: Vec<String> = Vec::new();
+    let m = model.trim();
+    let m = if m.is_empty() { "sonnet" } else { m };
+    flags.push("--model".to_string());
+    flags.push(m.to_string());
+
+    let mut ultra = false;
+    match effort.trim() {
+        "" => {}
+        "ultracode" => {
+            flags.push("--effort".to_string());
+            flags.push("xhigh".to_string());
+            ultra = true;
+        }
+        lvl => {
+            flags.push("--effort".to_string());
+            flags.push(lvl.to_string());
+        }
+    }
+    (flags, ultra)
+}
+
+/// POSIX single-quote a token so it survives `eval` in the shell integration
+/// untouched — critical for values like `opus[1m]` whose brackets are glob
+/// metacharacters that must never be word-split or filename-expanded.
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1618,6 +1741,14 @@ enum Overlay {
         options: Vec<String>,
         selected: usize,
     },
+    ModelPicker {
+        row: usize,
+        selected: usize,
+    },
+    EffortPicker {
+        row: usize,
+        selected: usize,
+    },
     TextInput {
         row: usize,
         field: String,
@@ -1880,7 +2011,7 @@ fn run_list_ui<W: std::io::Write>(
                 theme::border()
             };
 
-            let header_cells = ["", "Name", "Category", "Status", "Sessions", "Size", "Progress", "URL"]
+            let header_cells = ["", "Name", "Category", "Status", "Model", "Effort", "Sessions", "Size", "Progress", "URL"]
                 .iter()
                 .map(|h| Cell::from(*h).style(theme::header()));
             let header = Row::new(header_cells).height(1);
@@ -1904,6 +2035,8 @@ fn run_list_ui<W: std::io::Write>(
                     Cell::from("").style(qs_style),
                     Cell::from("").style(qs_style),
                     Cell::from("").style(qs_style),
+                    Cell::from("").style(qs_style),
+                    Cell::from("").style(qs_style),
                 ]));
 
                 // New Project virtual row
@@ -1915,6 +2048,8 @@ fn run_list_ui<W: std::io::Write>(
                 rows.push(Row::new(vec![
                     Cell::from("\u{2795}").style(np_style),
                     Cell::from("New Project").style(np_style),
+                    Cell::from("").style(np_style),
+                    Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
                     Cell::from("").style(np_style),
@@ -1951,11 +2086,30 @@ fn run_list_ui<W: std::io::Write>(
                     None => ("\u{2014}   ".to_string(), theme::dim(), "\u{2014}".to_string()),
                 };
 
+                // Model / Effort — dimmed when left at the effective defaults
+                // (Sonnet 5 / inherit) so overrides visually stand out.
+                let model_disp = model_label(&p.model);
+                let model_style = if p.model.trim().is_empty() || p.model == "sonnet" {
+                    theme::dim()
+                } else {
+                    Style::default().fg(theme::accent())
+                };
+                let effort_disp = effort_label(&p.effort);
+                let effort_style = if p.effort.trim().is_empty() {
+                    theme::dim()
+                } else if p.effort == "ultracode" {
+                    Style::default().fg(ratatui::style::Color::Magenta)
+                } else {
+                    Style::default().fg(theme::accent())
+                };
+
                 rows.push(Row::new(vec![
                     Cell::from(fav).style(theme::favorite()),
                     Cell::from(name).style(base),
                     Cell::from(p.category.clone()).style(base),
                     Cell::from(status_str.clone()).style(theme::status_style(&status_str)),
+                    Cell::from(model_disp).style(model_style),
+                    Cell::from(effort_disp).style(effort_style),
                     Cell::from(format!("{:>4}", p.session_count)).style(base),
                     Cell::from(size_str).style(theme::dim()),
                     Cell::from(prog_cell).style(prog_style),
@@ -1963,15 +2117,22 @@ fn run_list_ui<W: std::io::Write>(
                 ]));
             }
 
+            // URL is the SOLE flexible (Min) column and sits to the right of
+            // every click-target column, so Model/Effort/Status/Category all
+            // render at deterministic, fixed x-offsets. The mouse hit-test below
+            // depends on this — keep these in lockstep with the W_* constants
+            // and COL_SPACING in the mouse handler.
             let widths = [
-                Constraint::Length(2),
-                Constraint::Min(20),
-                Constraint::Length(14),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Min(10),
+                Constraint::Length(2),   // fav
+                Constraint::Length(26),  // name
+                Constraint::Length(12),  // category
+                Constraint::Length(9),   // status
+                Constraint::Length(12),  // model  ("Opus 4.8·1M" = 11)
+                Constraint::Length(10),  // effort ("ultracode"   = 9)
+                Constraint::Length(8),   // sessions
+                Constraint::Length(7),   // size
+                Constraint::Length(9),   // progress
+                Constraint::Min(12),     // url (sole flexible column, far right)
             ];
 
             let table = Table::new(rows, widths)
@@ -1983,6 +2144,7 @@ fn run_list_ui<W: std::io::Write>(
                     .title(" Projects ")
                     .title_style(theme::title()))
                 .row_highlight_style(Style::default().bg(theme::accent()).fg(theme::bg()))
+                .column_spacing(1)
                 .highlight_symbol(" \u{25b6} ");
 
             let mut table_widget_state = TableState::default();
@@ -2124,9 +2286,9 @@ fn run_list_ui<W: std::io::Write>(
             } else if active_tab == Tab::IntroPrompt {
                 " q:Quit  [ ]:Switch tab  g/p:Global/Project  e:Edit (in-TUI)  j/k:Scroll"
             } else if show_tree {
-                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
+                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  Tab:Focus  Space:Expand  d:Dashboard  t:Theme  c:Cat  s:Status  m:Model  e:Effort  x:Del  r:Rename  Enter:Open"
             } else {
-                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  d:Dashboard  t:Theme  c:Category  x:Delete  r:Rename  Enter:Open"
+                " q:Quit  j/k:\u{2191}\u{2193}  /:Search  [ ]:Tab  d:Dashboard  t:Theme  c:Cat  s:Status  m:Model  e:Effort  x:Del  r:Rename  Enter:Open"
             };
             let footer_idx = if show_tree { vertical_chunks.len() - 1 } else { 2 };
             let footer = Paragraph::new(footer_text).style(theme::dim());
@@ -2487,6 +2649,32 @@ fn run_list_ui<W: std::io::Write>(
                                 };
                             }
                         }
+                        KeyCode::Char('m') if active_tab == Tab::Projects => {
+                            // Model picker — pre-selects the project's current model.
+                            if focus == FocusPanel::Table
+                                && selected >= virtual_count
+                                && selected - virtual_count < projects.len()
+                            {
+                                let ri = selected - virtual_count;
+                                overlay = Overlay::ModelPicker {
+                                    row: ri,
+                                    selected: model_option_index(&projects[ri].model),
+                                };
+                            }
+                        }
+                        KeyCode::Char('e') if active_tab == Tab::Projects => {
+                            // Effort picker — pre-selects the project's current effort.
+                            if focus == FocusPanel::Table
+                                && selected >= virtual_count
+                                && selected - virtual_count < projects.len()
+                            {
+                                let ri = selected - virtual_count;
+                                overlay = Overlay::EffortPicker {
+                                    row: ri,
+                                    selected: effort_option_index(&projects[ri].effort),
+                                };
+                            }
+                        }
                         KeyCode::Enter if active_tab == Tab::Projects => {
                             if select_mode {
                                 if selected == 0 {
@@ -2523,33 +2711,47 @@ fn run_list_ui<W: std::io::Write>(
                                         &mut tree_state,
                                     );
 
-                                    // Check if click is on Status column (column offset ~36-46)
-                                    // Widths: 2 + 20(min) + 14 + 10 + 10 + 8
-                                    // Status column starts after fav(2) + name(~20) + category(14) = ~36
+                                    // Deterministic click-to-open. Every column
+                                    // left of URL is fixed-width, so column
+                                    // x-offsets are computable. Offsets are from
+                                    // the inner-left edge and include the leading
+                                    // highlight symbol (HL) plus 1-cell spacing
+                                    // (SP) between columns. Keep in lockstep with
+                                    // the `widths` array + `.column_spacing(1)`.
+                                    const HL: usize = 3; // " ▶ " highlight symbol
+                                    const SP: usize = 1; // column_spacing
+                                    const W_FAV: usize = 2;
+                                    const W_NAME: usize = 26;
+                                    const W_CAT: usize = 12;
+                                    const W_STATUS: usize = 9;
+                                    const W_MODEL: usize = 12;
+                                    const W_EFFORT: usize = 10;
                                     let col_in_table = (mouse.column as usize)
                                         .saturating_sub(table_area.x as usize + 1);
-                                    let inner_width = table_area.width.saturating_sub(2) as usize;
-                                    let name_width =
-                                        inner_width.saturating_sub(2 + 14 + 10 + 10 + 8);
-                                    let status_col_start = 2 + name_width + 14;
-                                    let status_col_end = status_col_start + 10;
-                                    let cat_col_start = 2 + name_width;
-                                    let cat_col_end = cat_col_start + 14;
+                                    let cat_start = HL + W_FAV + SP + W_NAME + SP;
+                                    let cat_end = cat_start + W_CAT;
+                                    let status_start = cat_end + SP;
+                                    let status_end = status_start + W_STATUS;
+                                    let model_start = status_end + SP;
+                                    let model_end = model_start + W_MODEL;
+                                    let effort_start = model_end + SP;
+                                    let effort_end = effort_start + W_EFFORT;
 
-                                    if selected >= virtual_count
+                                    // Only dispatch pickers when the fixed columns
+                                    // actually render at these offsets — i.e. the
+                                    // table is wide enough that ratatui hasn't
+                                    // clipped through the Effort column. On a
+                                    // narrower terminal a click just selects the
+                                    // row; the keyboard m/e/c/s pickers still work.
+                                    let inner_width = table_area.width.saturating_sub(2) as usize;
+                                    let layout_intact = effort_end <= inner_width;
+
+                                    if layout_intact
+                                        && selected >= virtual_count
                                         && selected - virtual_count < projects.len()
                                     {
                                         let ri = selected - virtual_count;
-                                        if col_in_table >= status_col_start
-                                            && col_in_table < status_col_end
-                                        {
-                                            overlay = Overlay::StatusPicker {
-                                                row: ri,
-                                                selected: 0,
-                                            };
-                                        } else if col_in_table >= cat_col_start
-                                            && col_in_table < cat_col_end
-                                        {
+                                        if col_in_table >= cat_start && col_in_table < cat_end {
                                             let project_dir = projects.get(ri)
                                                 .map(|p| home.join(&p.folder_name));
                                             let cats = collect_categories_with_detection(
@@ -2560,6 +2762,24 @@ fn run_list_ui<W: std::io::Write>(
                                                 row: ri,
                                                 options: cats,
                                                 selected: 0,
+                                            };
+                                        } else if col_in_table >= status_start
+                                            && col_in_table < status_end
+                                        {
+                                            overlay = Overlay::StatusPicker { row: ri, selected: 0 };
+                                        } else if col_in_table >= model_start
+                                            && col_in_table < model_end
+                                        {
+                                            overlay = Overlay::ModelPicker {
+                                                row: ri,
+                                                selected: model_option_index(&projects[ri].model),
+                                            };
+                                        } else if col_in_table >= effort_start
+                                            && col_in_table < effort_end
+                                        {
+                                            overlay = Overlay::EffortPicker {
+                                                row: ri,
+                                                selected: effort_option_index(&projects[ri].effort),
                                             };
                                         }
                                     }
@@ -2821,6 +3041,72 @@ fn render_overlay(
                 .collect();
             f.render_widget(List::new(items), inner);
         }
+        Overlay::ModelPicker { row, selected } => {
+            let title = if let Some(p) = projects.get(*row) {
+                format!(" Model: {} ", truncate_display(&p.display_name, 18))
+            } else {
+                " Model ".to_string()
+            };
+            let popup = centered_popup(area, 32, (MODEL_OPTIONS.len() + 2) as u16);
+            render_shadow(f, popup);
+            f.render_widget(Clear, popup);
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::accent()))
+                .border_type(BorderType::Rounded);
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+
+            let items: Vec<ListItem> = MODEL_OPTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, (_, label))| {
+                    let style = if i == *selected {
+                        Style::default().bg(theme::accent()).fg(theme::bg())
+                    } else {
+                        Style::default().fg(theme::fg())
+                    };
+                    let prefix = if i == *selected { "> " } else { "  " };
+                    ListItem::new(format!("{prefix}{label}")).style(style)
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+        }
+        Overlay::EffortPicker { row, selected } => {
+            let title = if let Some(p) = projects.get(*row) {
+                format!(" Effort: {} ", truncate_display(&p.display_name, 17))
+            } else {
+                " Effort ".to_string()
+            };
+            let popup = centered_popup(area, 30, (EFFORT_OPTIONS.len() + 2) as u16);
+            render_shadow(f, popup);
+            f.render_widget(Clear, popup);
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::accent()))
+                .border_type(BorderType::Rounded);
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+
+            let items: Vec<ListItem> = EFFORT_OPTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, (value, label))| {
+                    let style = if i == *selected {
+                        Style::default().bg(theme::accent()).fg(theme::bg())
+                    } else if *value == "ultracode" {
+                        Style::default().fg(ratatui::style::Color::Magenta)
+                    } else {
+                        Style::default().fg(theme::fg())
+                    };
+                    let prefix = if i == *selected { "> " } else { "  " };
+                    ListItem::new(format!("{prefix}{label}")).style(style)
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+        }
         Overlay::TextInput {
             field,
             input,
@@ -3029,6 +3315,48 @@ fn handle_overlay_event(
                 _ => OverlayAction::Consumed,
             }
         }
+        Overlay::ModelPicker { row, selected } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => OverlayAction::Close,
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1) % MODEL_OPTIONS.len();
+                OverlayAction::Consumed
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.checked_sub(1).unwrap_or(MODEL_OPTIONS.len() - 1);
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let row_val = *row;
+                let value = MODEL_OPTIONS[*selected].0;
+                if let Some(p) = projects.get(row_val) {
+                    let _ = mgr.set_field(&p.folder_name, "model", value);
+                    reload_projects(projects, sizes, mgr, home, mode);
+                }
+                OverlayAction::Close
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::EffortPicker { row, selected } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => OverlayAction::Close,
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1) % EFFORT_OPTIONS.len();
+                OverlayAction::Consumed
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.checked_sub(1).unwrap_or(EFFORT_OPTIONS.len() - 1);
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let row_val = *row;
+                let value = EFFORT_OPTIONS[*selected].0;
+                if let Some(p) = projects.get(row_val) {
+                    let _ = mgr.set_field(&p.folder_name, "effort", value);
+                    reload_projects(projects, sizes, mgr, home, mode);
+                }
+                OverlayAction::Close
+            }
+            _ => OverlayAction::Consumed,
+        },
         Overlay::TextInput {
             row,
             field,
@@ -3734,7 +4062,7 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 fn cmd_shell_init() -> Result<()> {
     print!(
         r#"# Projectwise — shell integration
-# Generated by cpm shell-init v3.8.0
+# Generated by cpm shell-init v3.9.0
 
 # Ensure Tokenizer is installed (once) and fire a background boost so Claude
 # starts with freshly-compressed .toon context. Fail-open: never blocks launch.
@@ -3753,7 +4081,18 @@ _projectwise_tokenizer() {{
 # digest as the initial prompt when present.
 _projectwise_launch() {{
   local _dir="$1"; shift
+  local _folder; _folder="$(basename "$_dir")"
   local _digest="$_dir/.projectwise/context-digest.md"
+  # Per-project starting model + effort (set in Projectwise's list: m:Model,
+  # e:Effort). `cpm launch-args` prints an eval-safe bash array with every token
+  # single-quoted, so glob-bearing values like opus[1m] survive intact. Pre-seed
+  # the Sonnet 5 default so a cpm error/empty output still launches sanely.
+  local PW_FLAGS=('--model' 'sonnet') PW_ULTRA=0
+  eval "$(cpm launch-args "$_folder" 2>/dev/null)" 2>/dev/null
+  # ultracode = xhigh + dynamic-workflow keyword: inject the trigger word so the
+  # session opts into workflow orchestration from the first turn.
+  local _ultra_kw=""
+  [[ "$PW_ULTRA" == "1" ]] && _ultra_kw="ultracode "
   # Intro prompt template: per-project override → global default → built-in.
   # Edit either via Projectwise's Intro tab (key 6). Guard on POST-cat content
   # (whitespace-stripped), not file size: an empty/whitespace-only template must
@@ -3770,9 +4109,9 @@ _projectwise_launch() {{
     _interview="Interview me to find the real goal of this project. Bias toward small, compartmentalized specs. Make me verify key decisions explicitly so nothing is missed."
   fi
   if [[ -s "$_digest" ]]; then
-    command claude --dangerously-skip-permissions "$_interview Then read the file $_digest -- it is the latest PROGRESS + ARCHITECTURE snapshot for this project; absorb it before interviewing me." "$@"
+    command claude --dangerously-skip-permissions "${{PW_FLAGS[@]}}" "${{_ultra_kw}}$_interview Then read the file $_digest -- it is the latest PROGRESS + ARCHITECTURE snapshot for this project; absorb it before interviewing me." "$@"
   else
-    command claude --dangerously-skip-permissions "$_interview" "$@"
+    command claude --dangerously-skip-permissions "${{PW_FLAGS[@]}}" "${{_ultra_kw}}$_interview" "$@"
   fi
 }}
 
@@ -3780,7 +4119,9 @@ projectwise() {{
   command -v claude &>/dev/null || {{ echo "Error: claude CLI not found" >&2; return 127; }}
   local _pd="${{CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}}"
   _projectwise_tokenizer
-  ( cpm rules-sync >/dev/null 2>&1 & ) 2>/dev/null  # keep readable rule mirror fresh (idempotent)
+  ( cpm rules-sync >/dev/null 2>&1 & ) 2>/dev/null     # keep readable rule mirror fresh (idempotent)
+  # SessionEnd handoff hook is registered in-process by `cpm pre-launch` (below),
+  # sequentially after guard_mcp_servers, so the two settings.json writers don't race.
   local _sel; _sel=$(cpm list --select) || return 1
   [[ -z "$_sel" ]] && return 1
   case "$_sel" in
@@ -3819,8 +4160,342 @@ fn cmd_prompt_input(label: &str) -> Result<()> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Launch args — resolve per-project model/effort for the shell integration
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Emit the resolved session-start flags for `folder` as an eval-able bash
+/// snippet consumed by `_projectwise_launch`. Always safe to eval: every token
+/// is POSIX single-quoted (so `opus[1m]`'s glob brackets survive verbatim).
+///
+///   PW_FLAGS=('--model' 'opus[1m]' '--effort' 'xhigh')
+///   PW_ULTRA=1
+///
+/// Fail-safe: an unknown/missing project still yields the Sonnet 5 default so a
+/// launch never silently falls back to the global model.
+fn cmd_launch_args(mgr: &RegistryManager, folder: &str) -> Result<()> {
+    let (model, effort) = match mgr.get(folder).ok().flatten() {
+        Some(p) => (p.model, p.effort),
+        None => ("sonnet".to_string(), String::new()),
+    };
+    let (flags, ultra) = resolve_launch_flags(&model, &effort);
+    let quoted: Vec<String> = flags.iter().map(|f| sh_squote(f)).collect();
+    println!("PW_FLAGS=({})", quoted.join(" "));
+    println!("PW_ULTRA={}", if ultra { 1 } else { 0 });
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SessionEnd handoff hook — install + idempotent registration
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The SessionEnd hook script. On session exit a headless Haiku pass consolidates
+/// a LIVING project handoff — read existing, dedup/merge this session's progress,
+/// write a whole-project summary + next-steps-to-100% — which the next launch
+/// surfaces first. Detached + re-entry-guarded + fail-open: never blocks exit.
+const PROJECTWISE_SESSION_END_SH: &str = r#"#!/usr/bin/env bash
+# Projectwise SessionEnd handoff generator — installed by `cpm install-hooks`.
+# Consolidates <project>/.projectwise/session-handoff.md on every session exit.
+# Fail-open: never blocks or errors session teardown.
+set -u
+
+# Re-entry guard: the summarizer below itself runs `claude`, whose own SessionEnd
+# would re-trigger this hook. Bail immediately when we are that inner invocation.
+[ -n "${PROJECTWISE_HANDOFF:-}" ] && exit 0
+
+_payload="$(cat 2>/dev/null || true)"
+_extract() { # $1 = top-level JSON string key
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$_payload" | jq -r ".$1 // empty" 2>/dev/null && return 0
+  fi
+  printf '%s' "$_payload" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+_dir="$(_extract cwd)"; [ -z "$_dir" ] && _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+_transcript="$(_extract transcript_path)"
+[ -d "$_dir" ] || exit 0
+
+# Only act on Projectwise projects: under ~/.claude/projects, or carrying a
+# .projectwise/ dir. Keeps unrelated `claude` sessions from spending Haiku.
+case "$_dir" in
+  "$HOME/.claude/projects/"*) : ;;
+  *) [ -d "$_dir/.projectwise" ] || exit 0 ;;
+esac
+
+_pw="$_dir/.projectwise"
+mkdir -p "$_pw" 2>/dev/null || exit 0
+_handoff="$_pw/session-handoff.md"
+
+_existing=""; [ -f "$_handoff" ] && _existing="$(cat "$_handoff" 2>/dev/null)"
+_progress=""; [ -f "$_dir/PROGRESS.md" ] && _progress="$(head -c 6000 "$_dir/PROGRESS.md" 2>/dev/null)"
+_git=""
+if git -C "$_dir" rev-parse --git-dir >/dev/null 2>&1; then
+  _git="$(git -C "$_dir" log --oneline -20 2>/dev/null; echo '---'; git -C "$_dir" status --short 2>/dev/null | head -40)"
+fi
+_tx=""; [ -n "$_transcript" ] && [ -f "$_transcript" ] && _tx="$(tail -c 24000 "$_transcript" 2>/dev/null)"
+
+read -r -d '' _prompt <<'__PW_HANDOFF_EOF__' || true
+You are maintaining a LIVING project handoff file for a software project. It is
+read at the START of the next working session, so it must be a truthful, current
+snapshot of the whole project — not an append log.
+
+Produce a single Markdown document with EXACTLY these two top-level sections:
+
+## Project summary (latest state)
+A concise whole-project summary at the CURRENT post-session state. Merge the new
+progress from this session into the existing summary. Remove anything now
+redundant, superseded, or already completed. Keep it tight and factual.
+
+## Next steps to 100%
+The planned and anticipated remaining work to carry this project to 100%
+completion, ordered by priority. Fold in anything newly discovered this session;
+drop items that are now finished.
+
+Output ONLY the Markdown (start at the first '## '). No preamble, no code fences.
+The context you must consolidate follows.
+__PW_HANDOFF_EOF__
+
+_prompt="$_prompt
+
+===== EXISTING HANDOFF (may be empty) =====
+$_existing
+
+===== PROGRESS.md (excerpt) =====
+$_progress
+
+===== GIT STATE =====
+$_git
+
+===== THIS SESSION (transcript tail) =====
+$_tx"
+
+# Run detached so /exit returns instantly. PROJECTWISE_HANDOFF=1 stops recursion.
+# A portable pure-bash watchdog bounds the run (macOS ships no timeout/gtimeout).
+# The living handoff is replaced ONLY on a clean, well-formed result — a failed,
+# killed, or garbled run never wipes it — and via mktemp+rename so two concurrent
+# same-project exits can't corrupt each other.
+nohup bash -c '
+  _out="$(mktemp)" || exit 0
+  PROJECTWISE_HANDOFF=1 claude -p --model claude-haiku-4-5-20251001 --effort low --dangerously-skip-permissions "$1" >"$_out" 2>/dev/null &
+  _cpid=$!
+  ( sleep 180; kill "$_cpid" 2>/dev/null ) &
+  _wdog=$!
+  wait "$_cpid"; _rc=$?
+  kill "$_wdog" 2>/dev/null
+  if [ "$_rc" -eq 0 ] && grep -q "^## " "$_out"; then
+    _tmp="$(mktemp "$2.XXXXXX")" && cp "$_out" "$_tmp" && mv "$_tmp" "$2"
+  fi
+  rm -f "$_out"
+' _ "$_prompt" "$_handoff" >/dev/null 2>&1 &
+exit 0
+"#;
+
+/// CLI entry point for `cpm install-hooks` (verbose). The actual work lives in
+/// `install_session_end_hook` so `cmd_pre_launch` can also run it — sequentially
+/// and in-process — avoiding a settings.json write race with `guard_mcp_servers`.
+fn cmd_install_hooks(_home: &std::path::Path) -> Result<()> {
+    install_session_end_hook(true)
+}
+
+/// Install the SessionEnd handoff hook script and idempotently register it in
+/// `~/.claude/settings.json`. Idempotent + fail-safe; `verbose` toggles the
+/// stderr status lines (on for the manual command, off for the pre-launch call).
+fn install_session_end_hook(verbose: bool) -> Result<()> {
+    use colored::*;
+    let claude = dirs::home_dir()
+        .map(|h| h.join(".claude"))
+        .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    let hooks_dir = claude.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+    let script_path = hooks_dir.join("projectwise-session-end.sh");
+
+    // Write/refresh the script only when its content actually changed.
+    let need_write = std::fs::read_to_string(&script_path)
+        .map(|s| s != PROJECTWISE_SESSION_END_SH)
+        .unwrap_or(true);
+    if need_write {
+        std::fs::write(&script_path, PROJECTWISE_SESSION_END_SH)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let settings_path = claude.join("settings.json");
+    // Shell-quote the script path so a $HOME with spaces/quotes can't break the
+    // hook command that Claude Code runs.
+    let command = format!("bash {}", sh_squote(&script_path.display().to_string()));
+    match register_session_end_hook(&settings_path, &command) {
+        Ok(true) if verbose => {
+            eprintln!("{} Projectwise SessionEnd handoff hook registered", "\u{2713}".green())
+        }
+        Ok(false) if verbose => {
+            eprintln!("{} Projectwise SessionEnd handoff hook already present", "i".blue())
+        }
+        Err(e) if verbose => eprintln!("{} could not register SessionEnd hook: {}", "!".yellow(), e),
+        _ => {}
+    }
+    if need_write && verbose {
+        eprintln!("{} handoff script \u{2192} {}", "\u{2713}".green(), script_path.display());
+    }
+    Ok(())
+}
+
+/// Ensure `settings_path`'s `hooks.SessionEnd` array contains an entry running
+/// `command`. Returns Ok(true) if it appended, Ok(false) if already present.
+/// Merges into whatever SessionEnd entries already exist — never overwrites.
+fn register_session_end_hook(settings_path: &std::path::Path, command: &str) -> Result<bool> {
+    // Load (or start) the settings object. An empty/whitespace-only file (e.g.
+    // a stray `touch`) is treated like a missing one, not a hard parse error.
+    let mut val: serde_json::Value = match std::fs::read_to_string(settings_path) {
+        Ok(c) if !c.trim().is_empty() => {
+            serde_json::from_str(&c).context("settings.json is not valid JSON")?
+        }
+        _ => serde_json::json!({}),
+    };
+    let obj = val
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
+
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings.hooks is not an object"))?;
+
+    let session_end = hooks_obj
+        .entry("SessionEnd")
+        .or_insert_with(|| serde_json::json!([]));
+    let arr = session_end
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings.hooks.SessionEnd is not an array"))?;
+
+    // Already present? Match on the stable script basename so a path rewrite or
+    // a `bash `-prefix difference still counts as installed.
+    let already = arr.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|inner| {
+                inner.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("projectwise-session-end.sh"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return Ok(false);
+    }
+
+    arr.push(serde_json::json!({
+        "hooks": [ { "type": "command", "command": command } ]
+    }));
+
+    // Backup, then atomic temp+rename (mirrors guard_mcp_servers).
+    if settings_path.exists() {
+        let _ = std::fs::copy(settings_path, settings_path.with_extension("json.pw-bak"));
+    }
+    let updated = serde_json::to_string_pretty(&val)?;
+    let tmp = settings_path.with_extension("json.pw-tmp");
+    std::fs::write(&tmp, &updated)?;
+    std::fs::rename(&tmp, settings_path)?;
+    Ok(true)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Pre-launch hooks
 // ═══════════════════════════════════════════════════════════════════════
+
+
+/// Ensure `~/.claude/settings.json` contains entries for the four required
+/// MCP servers: filesystem, typhoon-vps, tlrc, ruflo.
+///
+/// Rules:
+/// - If a key is already present in mcpServers → leave it untouched.
+/// - filesystem / typhoon-vps definitions are sourced from `~/.claude.json`
+///   so paths stay correct for this machine.
+/// - tlrc and ruflo use static definitions.
+/// - Fail-open: any error is logged and skipped; launch is never blocked.
+fn guard_mcp_servers() {
+    use colored::*;
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Source definitions for filesystem + typhoon-vps from ~/.claude.json.
+    let claude_json_path = home.join(".claude.json");
+    let user_mcps: serde_json::Value = std::fs::read_to_string(&claude_json_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("mcpServers").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let settings_path = home.join(".claude/settings.json");
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut val: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{} settings.json invalid JSON ({}), skipping MCP guard", "!".yellow(), e);
+            return;
+        }
+    };
+    let obj = match val.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    if !obj.contains_key("mcpServers") {
+        obj.insert("mcpServers".to_string(), serde_json::json!({}));
+    }
+    let mcp_obj = match obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+        Some(o) => o,
+        None => return,
+    };
+
+    const REQUIRED: &[&str] = &["filesystem", "typhoon-vps", "tlrc", "ruflo"];
+    let mut changed = false;
+    for key in REQUIRED {
+        if mcp_obj.contains_key(*key) {
+            continue;
+        }
+        let entry = match *key {
+            "filesystem" | "typhoon-vps" => match user_mcps.get(*key).cloned() {
+                Some(v) => v,
+                None => {
+                    eprintln!("{} {} not found in ~/.claude.json, skipping", "!".yellow(), key);
+                    continue;
+                }
+            },
+            "tlrc" => serde_json::json!({"type": "stdio", "command": "tlrc-mcp"}),
+            "ruflo" => serde_json::json!({"type": "stdio", "command": "ruflo", "args": ["mcp", "start"]}),
+            _ => continue,
+        };
+        mcp_obj.insert(key.to_string(), entry);
+        eprintln!("{} mcp {} \u{2192} added", "\u{2713}".green(), key);
+        changed = true;
+    }
+
+    if !changed {
+        return;
+    }
+    let updated = match serde_json::to_string_pretty(&val) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let tmp = settings_path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &updated).is_ok()
+        && std::fs::rename(&tmp, &settings_path).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("{} could not write settings.json (MCP guard)", "!".yellow());
+    }
+}
 
 fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -> Result<()> {
     use colored::*;
@@ -3831,6 +4506,12 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
         eprintln!("{} Directory missing: {}", "!".yellow(), dir.display());
         return Ok(());
     }
+
+    guard_mcp_servers();
+    // Register the SessionEnd handoff hook here — sequentially, in the same
+    // process, right after guard_mcp_servers — so the two settings.json writers
+    // never race (they did when install-hooks was backgrounded separately).
+    let _ = install_session_end_hook(false);
 
     if cmd_exists("axon") {
         let d = dir.display().to_string();
@@ -3844,17 +4525,15 @@ fn cmd_pre_launch(mgr: &RegistryManager, home: &std::path::Path, folder: &str) -
         eprintln!("{} axon analyze (background)", "\u{2713}".green());
     }
 
-    if cmd_exists("tldr") {
-        let d = dir.clone();
+    if cmd_exists("tlrc") {
         std::thread::spawn(move || {
-            let _ = std::process::Command::new("tldr")
-                .args(["warm", "."])
-                .current_dir(&d)
+            let _ = std::process::Command::new("tlrc")
+                .args(["--update"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
         });
-        eprintln!("{} tldr warm (background)", "\u{2713}".green());
+        eprintln!("{} tlrc update (background)", "\u{2713}".green());
     }
 
     if cmd_exists("claude-context") {
@@ -4072,7 +4751,7 @@ fn cmd_cleanup(home: &std::path::Path, sub: CleanupSub) -> Result<()> {
         CleanupSub::Prune { days } => {
             let threshold = chrono::Utc::now() - chrono::Duration::days(days as i64);
             let mut removed = 0usize;
-            let cache_dirs = [".axon", ".tldr", ".claude-context"];
+            let cache_dirs = [".axon", ".claude-context"];
 
             if home.exists() {
                 for entry in std::fs::read_dir(home)? {
@@ -4399,5 +5078,121 @@ mod tab_tests {
             cursor = next;
         }
         assert_eq!(cursor, 2);
+    }
+
+    // ── Model / Effort resolution ──────────────────────────────────────
+
+    #[test]
+    fn resolve_flags_default_is_sonnet_no_effort() {
+        // Unset model ⇒ forced Sonnet 5; unset effort ⇒ no --effort flag.
+        let (flags, ultra) = resolve_launch_flags("", "");
+        assert_eq!(flags, vec!["--model", "sonnet"]);
+        assert!(!ultra);
+    }
+
+    #[test]
+    fn resolve_flags_opus_1m_preserved_verbatim() {
+        // The glob-bearing [1m] token must reach --model untouched.
+        let (flags, ultra) = resolve_launch_flags("opus[1m]", "max");
+        assert_eq!(flags, vec!["--model", "opus[1m]", "--effort", "max"]);
+        assert!(!ultra);
+    }
+
+    #[test]
+    fn resolve_flags_ultracode_is_xhigh_plus_flag() {
+        // ultracode is NOT a CLI effort value → xhigh + the ultracode signal.
+        let (flags, ultra) = resolve_launch_flags("opus", "ultracode");
+        assert_eq!(flags, vec!["--model", "opus", "--effort", "xhigh"]);
+        assert!(ultra);
+    }
+
+    #[test]
+    fn resolve_flags_plain_levels_passthrough() {
+        for lvl in ["low", "medium", "high", "xhigh"] {
+            let (flags, ultra) = resolve_launch_flags("haiku", lvl);
+            assert_eq!(flags, vec!["--model".to_string(), "haiku".to_string(),
+                                   "--effort".to_string(), lvl.to_string()]);
+            assert!(!ultra);
+        }
+    }
+
+    #[test]
+    fn sh_squote_neutralizes_glob_and_quotes() {
+        assert_eq!(sh_squote("opus[1m]"), "'opus[1m]'");
+        assert_eq!(sh_squote("--model"), "'--model'");
+        // Embedded single quote is escaped via the '\'' idiom.
+        assert_eq!(sh_squote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn labels_and_indices_round_trip() {
+        assert_eq!(model_label(""), "Sonnet 5");
+        assert_eq!(model_label("opus[1m]"), "Opus 4.8\u{00b7}1M");
+        assert_eq!(model_label("mystery"), "mystery"); // unknown falls back to raw
+        assert_eq!(model_option_index("opus[1m]"), 2);
+        assert_eq!(model_option_index("nope"), 0); // unknown ⇒ default Sonnet
+        assert_eq!(effort_label(""), "Default");
+        assert_eq!(effort_label("ultracode"), "ultracode");
+        assert_eq!(effort_option_index("ultracode"), 6);
+        assert_eq!(effort_option_index(""), 0);
+    }
+
+    #[test]
+    fn install_hook_is_idempotent_and_preserves_existing() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        // Seed a settings file that already carries an unrelated SessionEnd hook.
+        let seed = serde_json::json!({
+            "model": "sonnet",
+            "hooks": { "SessionEnd": [
+                { "hooks": [ { "type": "command", "command": "bash /other/thing.sh" } ] }
+            ] }
+        });
+        let mut f = std::fs::File::create(&settings).unwrap();
+        f.write_all(serde_json::to_string_pretty(&seed).unwrap().as_bytes()).unwrap();
+        drop(f);
+
+        // First registration appends our entry and reports a change.
+        let cmd = "bash /Users/x/.claude/hooks/projectwise-session-end.sh";
+        assert!(register_session_end_hook(&settings, cmd).unwrap());
+        // Second registration is a no-op.
+        assert!(!register_session_end_hook(&settings, cmd).unwrap());
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let arr = after["hooks"]["SessionEnd"].as_array().unwrap();
+        // Existing hook preserved + exactly one projectwise entry added.
+        assert_eq!(arr.len(), 2);
+        assert_eq!(after["model"], "sonnet"); // untouched sibling key
+        let pw = arr.iter().filter(|g| {
+            serde_json::to_string(g).unwrap().contains("projectwise-session-end.sh")
+        }).count();
+        assert_eq!(pw, 1);
+    }
+
+    #[test]
+    fn install_hook_creates_missing_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json"); // does not exist yet
+        let cmd = "bash /x/projectwise-session-end.sh";
+        assert!(register_session_end_hook(&settings, cmd).unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn install_hook_tolerates_empty_settings_file() {
+        // A 0-byte / whitespace-only settings.json must be treated as {} — not a
+        // hard parse error that permanently blocks registration.
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, "   \n").unwrap();
+        let cmd = "bash /x/projectwise-session-end.sh";
+        assert!(register_session_end_hook(&settings, cmd).unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
     }
 }

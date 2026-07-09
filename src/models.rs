@@ -24,6 +24,16 @@ pub struct Project {
     pub favorite: bool,
     #[serde(default)]
     pub archive_path: Option<String>,
+    /// Starting model for a Projectwise-launched session. Stored as a canonical
+    /// key (see `main::model_options`): "sonnet" | "opus" | "opus[1m]" | "haiku"
+    /// | "fable". Empty/missing resolves to the default ("sonnet") at launch.
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// Starting effort level for a Projectwise-launched session. One of
+    /// "" (inherit — no flag) | "low" | "medium" | "high" | "xhigh" | "max" |
+    /// "ultracode" (= xhigh + dynamic-workflow keyword). See `main::effort_options`.
+    #[serde(default)]
+    pub effort: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -110,4 +120,9 @@ fn default_category() -> String {
 }
 fn default_status() -> ProjectStatus {
     ProjectStatus::Active
+}
+/// Default starting model key. New/unset projects launch on Sonnet 5 (which has
+/// a native 1M-token context window), per founder directive.
+pub fn default_model() -> String {
+    "sonnet".to_string()
 }
