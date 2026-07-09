@@ -68,3 +68,5 @@ Three features added (all in `src/main.rs`, version bumped 3.4.0 → 3.5.0 in `C
 `2026-06-14` · task `pw-v3.7.1` · `v3.7.1 — PROD hardening (code review + E2E)` · `done` · commit `90505fa`; merged `7c9abe2`; finalize `67b4ae2`
 `2026-06-14` · task `pw-release-v3.7.1` · `Release + install — README, CI, install, PR merge, tag v3.7.1` · `done` · commit `7c9abe2` (merge PR #1), tag `v3.7.1` at `67b4ae2`
 `2026-06-16` · task `pw-v3.8.0` · `v3.8.0 — Agents tab, intro-prompt template + in-TUI editor (src/editor.rs)` · `done`
+`2026-07-09` · task `pw-v3.9.0` · `v3.9.0 — per-project Model + Effort columns + self-consolidating session handoff` · `done` · commit `fe095f0` on branch `feat/model-effort-handoff-v3.9.0` (not yet merged to main)
+`2026-07-09` · task `pw-v3.10.0` · `v3.10.0 — replace Tokenizer with Cloptimizer in tab 2 + shell glue` · `done` · commit `4e9ef03` on branch `feat/cloptimizer-tab-v3.10.0` (builds on v3.9.0's `fe095f0`; not yet merged to main)
