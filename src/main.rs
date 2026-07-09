@@ -76,7 +76,7 @@ fn get_home() -> PathBuf {
 #[derive(Parser)]
 #[command(
     name = "cpm",
-    version = "3.9.0",
+    version = "3.10.0",
     about = "Projectwise — TUI project manager for Claude Code"
 )]
 struct Cli {
@@ -250,7 +250,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Version) => {
-            println!("Projectwise v3.9.0");
+            println!("Projectwise v3.10.0");
             Ok(())
         }
         Some(Commands::ListFzf { mode }) => cmd_list_fzf(&mgr, &mode),
@@ -728,7 +728,7 @@ impl FocusPanel {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Projects,
-    Tokenizer,
+    Cloptimizer,
     ClaudeMd,
     Rules,
     Agents,
@@ -738,8 +738,8 @@ enum Tab {
 impl Tab {
     fn next(self) -> Self {
         match self {
-            Tab::Projects => Tab::Tokenizer,
-            Tab::Tokenizer => Tab::ClaudeMd,
+            Tab::Projects => Tab::Cloptimizer,
+            Tab::Cloptimizer => Tab::ClaudeMd,
             Tab::ClaudeMd => Tab::Rules,
             Tab::Rules => Tab::Agents,
             Tab::Agents => Tab::IntroPrompt,
@@ -749,8 +749,8 @@ impl Tab {
     fn prev(self) -> Self {
         match self {
             Tab::Projects => Tab::IntroPrompt,
-            Tab::Tokenizer => Tab::Projects,
-            Tab::ClaudeMd => Tab::Tokenizer,
+            Tab::Cloptimizer => Tab::Projects,
+            Tab::ClaudeMd => Tab::Cloptimizer,
             Tab::Rules => Tab::ClaudeMd,
             Tab::Agents => Tab::Rules,
             Tab::IntroPrompt => Tab::Agents,
@@ -759,7 +759,7 @@ impl Tab {
     fn index(self) -> usize {
         match self {
             Tab::Projects => 0,
-            Tab::Tokenizer => 1,
+            Tab::Cloptimizer => 1,
             Tab::ClaudeMd => 2,
             Tab::Rules => 3,
             Tab::Agents => 4,
@@ -768,145 +768,296 @@ impl Tab {
     }
 }
 
-// ── Tokenizer integration helpers ───────────────────────────────────
+// ── Cloptimizer integration helpers ─────────────────────────────────
+//
+// Cloptimizer is the successor to Tokenizer: a strict CLI superset (same
+// optimize / install-timer / install-hook) that also (a) compacts agent
+// frontmatter `description:` fields in place — the pass that actually cuts
+// Claude's session-start token cost — and (b) monitors/reaps the orphaned
+// MCP/node processes Claude Code leaks. See ~/Cloptimizer/PROJECTWISE-HANDOVER.md.
 
-struct TokStatus {
+/// Cheap, per-frame install state (only file-existence stats).
+struct CloptStatus {
     bin_exists: bool,
     timer_installed: bool,
     hook_installed: bool,
 }
 
-/// Resolve the tokenizer binary path (override with TOKENIZER_BIN).
-fn tokenizer_bin() -> PathBuf {
-    std::env::var("TOKENIZER_BIN")
+/// Heavy hygiene snapshot parsed from `cloptimizer report --json`. Fetched
+/// lazily and cached (a full scan of ~/.claude + the process table is far too
+/// expensive to run every render frame).
+#[derive(Clone)]
+struct CloptReport {
+    convertible_files: u64,
+    tokens_saveable: u64,
+    claude_sessions: u64,
+    orphans: u64,
+    reapable: u64,
+    reclaimable_mb: u64,
+    tracked_mb: u64,
+}
+
+/// Resolve the cloptimizer binary path (override with CLOPTIMIZER_BIN).
+fn cloptimizer_bin() -> PathBuf {
+    std::env::var("CLOPTIMIZER_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
                 .unwrap_or_default()
-                .join(".cargo/bin/tokenizer")
+                .join(".cargo/bin/cloptimizer")
         })
 }
 
-/// Read-only inspection of Tokenizer's install state (matches the paths
-/// Tokenizer's daemon.rs writes to).
-fn tok_status() -> TokStatus {
+/// Cloptimizer's state dir (macOS Application Support; XDG-ish elsewhere).
+fn cloptimizer_state_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/cloptimizer")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local/share/cloptimizer")
+    }
+}
+
+/// Read-only inspection of Cloptimizer's install state (matches the marker
+/// paths Cloptimizer writes to).
+fn clopt_status() -> CloptStatus {
     let home = dirs::home_dir().unwrap_or_default();
     let timer = {
         #[cfg(target_os = "macos")]
         {
-            home.join("Library/LaunchAgents/com.tokenizer.plist")
+            home.join("Library/LaunchAgents/com.cloptimizer.plist")
         }
         #[cfg(target_os = "linux")]
         {
-            home.join(".config/systemd/user/tokenizer.timer")
+            home.join(".config/systemd/user/cloptimizer.timer")
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            home.join(".config/tokenizer/.timer-installed")
+            home.join(".config/cloptimizer/.timer-installed")
         }
     };
     let hook = {
         #[cfg(windows)]
         {
-            home.join(".claude/hooks/tokenizer-post-session.ps1")
+            home.join(".claude/hooks/cloptimizer-post-session.ps1")
         }
         #[cfg(not(windows))]
         {
-            home.join(".claude/hooks/tokenizer-post-session.sh")
+            home.join(".claude/hooks/cloptimizer-post-session.sh")
         }
     };
-    TokStatus {
-        bin_exists: tokenizer_bin().exists() || cmd_exists("tokenizer"),
+    CloptStatus {
+        bin_exists: cloptimizer_bin().exists() || cmd_exists("cloptimizer"),
         timer_installed: timer.exists(),
         hook_installed: hook.exists(),
     }
 }
 
-/// Fire a background `tokenizer optimize --quiet` (non-blocking, fail-open).
-fn spawn_tokenizer_optimize() {
-    let bin = tokenizer_bin();
+/// The `~/.claude` dir to pin cloptimizer against (keeps its headless path
+/// non-interactive — never falls back to an fzf directory picker).
+fn clopt_claude_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".claude")
+}
+
+/// Fetch + parse `cloptimizer report --json`. Returns None on any failure
+/// (missing binary, non-zero exit, bad JSON) — the caller shows an install hint.
+fn clopt_fetch_report() -> Option<CloptReport> {
+    let claude = clopt_claude_dir();
+    let out = std::process::Command::new(cloptimizer_bin())
+        .args(["report", "--json", "--claude-dir"])
+        .arg(&claude)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_clopt_report(&out.stdout)
+}
+
+/// Pure parser for `cloptimizer report --json` output (extracted for testing).
+/// Returns None if the two expected top-level objects are absent; missing
+/// numeric fields default to 0.
+fn parse_clopt_report(json: &[u8]) -> Option<CloptReport> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let o = v.get("optimize")?;
+    let p = v.get("processes")?;
+    let u = |val: &serde_json::Value, k: &str| val.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    Some(CloptReport {
+        convertible_files: u(o, "convertible_files"),
+        tokens_saveable: u(o, "tokens_saveable_est"),
+        claude_sessions: u(p, "claude_sessions"),
+        orphans: u(p, "orphans"),
+        reapable: u(p, "reapable"),
+        reclaimable_mb: u(p, "reclaimable_rss_mb"),
+        tracked_mb: u(p, "tracked_rss_mb"),
+    })
+}
+
+/// The manifest id of the most recent in-place conversion (for `u` rollback),
+/// or None if nothing has been converted yet.
+fn clopt_last_manifest_id() -> Option<String> {
+    let manifest = cloptimizer_state_dir().join("manifest.jsonl");
+    let content = std::fs::read_to_string(manifest).ok()?;
+    last_manifest_id_from(&content)
+}
+
+/// Pure helper (extracted for testing): the most recent PARSEABLE manifest entry
+/// carrying an id. A truncated/corrupt tail line (e.g. a crash mid-append) must
+/// not mask the valid history beneath it, so unparseable lines are skipped.
+fn last_manifest_id_from(content: &str) -> Option<String> {
+    content
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        })
+}
+
+/// Group a count with thousands separators (e.g. 60973 → "60,973").
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Fire a background `cloptimizer optimize --quiet` (non-blocking, fail-open).
+/// `--claude-dir` keeps it from falling back to an interactive fzf picker.
+fn spawn_cloptimizer_optimize() {
+    let bin = cloptimizer_bin();
+    let claude = clopt_claude_dir();
     std::thread::spawn(move || {
         let _ = std::process::Command::new(&bin)
-            .args(["optimize", "--quiet"])
+            .args(["optimize", "--quiet", "--claude-dir"])
+            .arg(&claude)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     });
 }
 
-/// Run a tokenizer subcommand in the foreground (used after suspending the TUI).
-fn run_tokenizer_cmd(args: &[&str]) -> Result<()> {
-    let _ = std::process::Command::new(tokenizer_bin())
+/// Run a cloptimizer subcommand in the foreground (used after suspending the TUI).
+fn run_cloptimizer_cmd(args: &[&str]) -> Result<()> {
+    let _ = std::process::Command::new(cloptimizer_bin())
         .args(args)
         .status();
     Ok(())
 }
 
-/// Render the Tokenizer status tab into `area`.
-fn render_tokenizer_tab(f: &mut ratatui::Frame, area: ratatui::layout::Rect, st: &TokStatus) {
+/// Render the Cloptimizer status tab into `area`. `report` is the cached
+/// `report --json` snapshot (None until first fetched / on fetch failure).
+fn render_cloptimizer_tab(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    st: &CloptStatus,
+    report: &Option<CloptReport>,
+) {
     use ratatui::prelude::*;
     use ratatui::widgets::*;
 
     let mark = |b: bool| if b { "\u{2713}" } else { "\u{00b7}" };
     let state = |b: bool, on: &str, off: &str| format!("{} {}", mark(b), if b { on } else { off });
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Tokenizer \u{2014} Claude context optimizer (.md/.json \u{2192} .toon)",
+            "  Cloptimizer \u{2014} Claude Code hygiene: token-optimize ~/.claude + reap leaked MCP procs",
             theme::title(),
         )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Binary:        ", theme::dim()),
             Span::styled(
-                state(st.bin_exists, "installed", "missing (cargo install --path ~/Tokenizer)"),
+                state(st.bin_exists, "installed", "missing (cargo install --path ~/Cloptimizer)"),
                 theme::row_normal(),
             ),
         ]),
         Line::from(vec![
             Span::styled("  Launch timer:  ", theme::dim()),
-            Span::styled(state(st.timer_installed, "installed (hourly)", "not installed"), theme::row_normal()),
+            Span::styled(state(st.timer_installed, "installed (hourly)", "not installed \u{2014} press i"), theme::row_normal()),
         ]),
         Line::from(vec![
             Span::styled("  Session hook:  ", theme::dim()),
-            Span::styled(state(st.hook_installed, "installed", "not installed"), theme::row_normal()),
+            Span::styled(state(st.hook_installed, "installed", "not installed \u{2014} press h"), theme::row_normal()),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled("  Actions", theme::header())]),
-        Line::from(vec![
-            Span::styled("    o  ", Style::default().fg(theme::accent())),
-            Span::styled("run optimize now (background)", theme::dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("    T  ", Style::default().fg(theme::accent())),
-            Span::styled("open the full Tokenizer TUI", theme::dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("    i  ", Style::default().fg(theme::accent())),
-            Span::styled("install hourly launch timer", theme::dim()),
-        ]),
-        Line::from(vec![
-            Span::styled("    h  ", Style::default().fg(theme::accent())),
-            Span::styled("install post-session hook", theme::dim()),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Tokenizer is launched + boosted automatically each time you summon Projectwise.",
-            theme::dim(),
-        )]),
-        Line::from(vec![Span::styled(
-            "  Switch tabs with [ and ].",
-            theme::dim(),
-        )]),
     ];
+
+    // Live hygiene snapshot (from `cloptimizer report --json`), or a loading hint.
+    match report {
+        Some(r) => {
+            lines.push(Line::from(vec![
+                Span::styled("  Optimize:      ", theme::dim()),
+                Span::styled(
+                    format!("{} convertible file(s) \u{00b7} ~{} tokens saveable",
+                        r.convertible_files, group_thousands(r.tokens_saveable)),
+                    Style::default().fg(theme::accent()),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Processes:     ", theme::dim()),
+                Span::styled(
+                    format!("{} live \u{00b7} {} orphan \u{00b7} {} reapable \u{00b7} {} MB reclaimable / {} MB tracked",
+                        r.claude_sessions, r.orphans, r.reapable, r.reclaimable_mb, r.tracked_mb),
+                    theme::row_normal(),
+                ),
+            ]));
+        }
+        None => {
+            lines.push(Line::from(vec![Span::styled(
+                if st.bin_exists { "  (fetching hygiene report \u{2026} press p to refresh)" }
+                else { "  (install the binary to see the hygiene report)" },
+                theme::dim(),
+            )]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  Actions", theme::header())]));
+    for (k, desc) in [
+        ("o", "run optimize now (background \u{2014} also compacts agent descriptions)"),
+        ("T", "open the full Cloptimizer TUI (5 tabs)"),
+        ("i", "install hourly launch timer"),
+        ("h", "install post-session hook"),
+        ("R", "reap leaked orphan processes (gated \u{2014} never kills a live session)"),
+        ("p", "refresh the hygiene report"),
+        ("u", "roll back the last in-place change"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {k}  "), Style::default().fg(theme::accent())),
+            Span::styled(desc, theme::dim()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Boost also compacts agent descriptions in place (backed up \u{00b7} rollback-able \u{00b7} toggle in the Cloptimizer TUI Settings).",
+        theme::dim(),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  Cloptimizer is launched + boosted automatically each time you summon Projectwise. Process-reaping is opt-in (press R).",
+        theme::dim(),
+    )]));
 
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme::border())
-            .title(" Tokenizer ")
+            .title(" Cloptimizer ")
             .title_style(theme::title()),
     );
     f.render_widget(p, area);
@@ -940,6 +1091,31 @@ fn resume_tui<W: std::io::Write>(
     execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     Ok(())
+}
+
+/// Pause (while the TUI is suspended, i.e. cooked mode) so a command's output
+/// stays visible until the user presses Enter. Used by the Cloptimizer reap /
+/// rollback actions whose results would otherwise vanish on resume.
+fn wait_for_enter() -> Result<()> {
+    use std::io::Write;
+    print!("\n[Cloptimizer] Press Enter to return to Projectwise\u{2026} ");
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+    Ok(())
+}
+
+/// Prompt (in cooked mode during a TUI suspend) and return true only on an
+/// explicit y/yes. Gates the irreversible reap action.
+fn confirm_yes(prompt: &str) -> bool {
+    use std::io::Write;
+    print!("{prompt} [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    if std::io::stdin().read_line(&mut buf).is_err() {
+        return false;
+    }
+    matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Suspend the TUI, run fzf over the folder names directly under
@@ -1792,6 +1968,13 @@ fn run_list_ui<W: std::io::Write>(
     let mut active_tab = Tab::Projects;
     let mut overlay = Overlay::None;
 
+    // Cloptimizer tab: cached `report --json` snapshot. The scan is heavy, so it
+    // runs on a BACKGROUND thread (never blocking the UI) and is delivered over a
+    // channel; `p` invalidates the cache to force a refresh.
+    let mut clopt_report: Option<CloptReport> = None;
+    let mut clopt_report_fetched = false;
+    let mut clopt_report_rx: Option<std::sync::mpsc::Receiver<Option<CloptReport>>> = None;
+
     // CLAUDE.md tab state: true = global (~/.claude/CLAUDE.md), false = project.
     let mut claude_md_global = true;
     let mut claude_scroll: u16 = 0;
@@ -1833,7 +2016,24 @@ fn run_list_ui<W: std::io::Write>(
             .map(|ts| filetree::flatten(&ts.root))
             .unwrap_or_default();
 
-        let tokstat = tok_status();
+        let cloptstat = clopt_status();
+        // Kick off a background fetch of the heavy hygiene report when the tab is
+        // shown and none is in flight — never blocks the render/poll loop.
+        if active_tab == Tab::Cloptimizer && !clopt_report_fetched && clopt_report_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(clopt_fetch_report());
+            });
+            clopt_report_rx = Some(rx);
+        }
+        // Collect a completed background fetch without blocking.
+        if let Some(rx) = &clopt_report_rx {
+            if let Ok(result) = rx.try_recv() {
+                clopt_report = result;
+                clopt_report_fetched = true;
+                clopt_report_rx = None;
+            }
+        }
 
         // CLAUDE.md tab body (read fresh each frame; files are small).
         let claude_path = if claude_md_global {
@@ -1942,7 +2142,7 @@ fn run_list_ui<W: std::io::Write>(
             // Title bar with tabs
             let tabs = Tabs::new(vec![
                 Line::from(" 1 Projects "),
-                Line::from(" 2 Tokenizer "),
+                Line::from(" 2 Cloptimizer "),
                 Line::from(" 3 CLAUDE.md "),
                 Line::from(" 4 RULES "),
                 Line::from(" 5 Agents "),
@@ -1984,8 +2184,8 @@ fn run_list_ui<W: std::io::Write>(
                 )
             };
 
-            if active_tab == Tab::Tokenizer {
-                render_tokenizer_tab(f, tok_content_area, &tokstat);
+            if active_tab == Tab::Cloptimizer {
+                render_cloptimizer_tab(f, tok_content_area, &cloptstat, &clopt_report);
             } else if active_tab == Tab::ClaudeMd {
                 render_text_tab(f, tok_content_area, claude_title, &claude_body, claude_scroll);
             } else if active_tab == Tab::Rules {
@@ -2275,8 +2475,8 @@ fn run_list_ui<W: std::io::Write>(
             } // end Projects-tab content
 
             // Footer
-            let footer_text: &str = if active_tab == Tab::Tokenizer {
-                " q:Quit  [ ]:Switch tab  o:Optimize  T:Tokenizer-TUI  i:Install-Timer  h:Install-Hook"
+            let footer_text: &str = if active_tab == Tab::Cloptimizer {
+                " q:Quit  [ ]:Tab  o:Optimize  T:Cloptimizer-TUI  i:Timer  h:Hook  R:Reap  p:Refresh  u:Rollback"
             } else if active_tab == Tab::ClaudeMd {
                 " q:Quit  [ ]:Switch tab  g/p:Global/Project  e:Edit  j/k:Scroll"
             } else if active_tab == Tab::Rules {
@@ -2329,7 +2529,7 @@ fn run_list_ui<W: std::io::Write>(
                         KeyCode::Char(']') => active_tab = active_tab.next(),
                         KeyCode::Char('[') => active_tab = active_tab.prev(),
                         KeyCode::Char('1') => active_tab = Tab::Projects,
-                        KeyCode::Char('2') => active_tab = Tab::Tokenizer,
+                        KeyCode::Char('2') => active_tab = Tab::Cloptimizer,
                         KeyCode::Char('3') => active_tab = Tab::ClaudeMd,
                         KeyCode::Char('4') => active_tab = Tab::Rules,
                         KeyCode::Char('5') => active_tab = Tab::Agents,
@@ -2350,23 +2550,56 @@ fn run_list_ui<W: std::io::Write>(
                                 }
                             }
                         }
-                        KeyCode::Char('o') if active_tab == Tab::Tokenizer => {
-                            spawn_tokenizer_optimize();
+                        KeyCode::Char('o') if active_tab == Tab::Cloptimizer => {
+                            spawn_cloptimizer_optimize();
                         }
-                        KeyCode::Char('T') if active_tab == Tab::Tokenizer => {
+                        KeyCode::Char('T') if active_tab == Tab::Cloptimizer => {
                             suspend_tui(terminal)?;
-                            let _ = run_tokenizer_cmd(&["tui"]);
+                            let _ = run_cloptimizer_cmd(&["tui"]);
+                            resume_tui(terminal)?;
+                            clopt_report_fetched = false; // refresh on return
+                        }
+                        KeyCode::Char('i') if active_tab == Tab::Cloptimizer => {
+                            suspend_tui(terminal)?;
+                            let _ = run_cloptimizer_cmd(&["install-timer"]);
                             resume_tui(terminal)?;
                         }
-                        KeyCode::Char('i') if active_tab == Tab::Tokenizer => {
+                        KeyCode::Char('h') if active_tab == Tab::Cloptimizer => {
                             suspend_tui(terminal)?;
-                            let _ = run_tokenizer_cmd(&["install-timer"]);
+                            let _ = run_cloptimizer_cmd(&["install-hook"]);
                             resume_tui(terminal)?;
                         }
-                        KeyCode::Char('h') if active_tab == Tab::Tokenizer => {
+                        KeyCode::Char('R') if active_tab == Tab::Cloptimizer => {
+                            // Reap leaked orphan processes. Gated in Cloptimizer
+                            // (a live session's processes are never killed), but a
+                            // kill is irreversible — unlike the file actions, which
+                            // `u` can roll back — so show the plan and confirm first.
                             suspend_tui(terminal)?;
-                            let _ = run_tokenizer_cmd(&["install-hook"]);
+                            let _ = run_cloptimizer_cmd(&["reap"]); // dry-run: prints plan only
+                            if confirm_yes("\nReap the orphan process(es) listed above?") {
+                                let _ = run_cloptimizer_cmd(&["reap", "--yes"]);
+                                let _ = wait_for_enter();
+                            }
                             resume_tui(terminal)?;
+                            clopt_report_fetched = false; // process counts may have changed
+                        }
+                        KeyCode::Char('p') if active_tab == Tab::Cloptimizer => {
+                            clopt_report_fetched = false; // force re-fetch of the report
+                        }
+                        KeyCode::Char('u') if active_tab == Tab::Cloptimizer => {
+                            // Roll back the most recent in-place conversion.
+                            suspend_tui(terminal)?;
+                            match clopt_last_manifest_id() {
+                                Some(id) => {
+                                    let _ = run_cloptimizer_cmd(&["rollback", &id]);
+                                }
+                                None => {
+                                    println!("Nothing to roll back (no cloptimizer manifest entries yet).");
+                                }
+                            }
+                            let _ = wait_for_enter();
+                            resume_tui(terminal)?;
+                            clopt_report_fetched = false;
                         }
                         // ── CLAUDE.md tab ──
                         KeyCode::Char('g') if active_tab == Tab::ClaudeMd => {
@@ -4062,19 +4295,22 @@ fn cmd_registry(mgr: &RegistryManager, sub: RegistrySub) -> Result<()> {
 fn cmd_shell_init() -> Result<()> {
     print!(
         r#"# Projectwise — shell integration
-# Generated by cpm shell-init v3.9.0
+# Generated by cpm shell-init v3.10.0
 
-# Ensure Tokenizer is installed (once) and fire a background boost so Claude
-# starts with freshly-compressed .toon context. Fail-open: never blocks launch.
-_projectwise_tokenizer() {{
-  local tok="${{TOKENIZER_BIN:-$HOME/.cargo/bin/tokenizer}}"
-  [[ -x "$tok" ]] || return 0
+# Ensure Cloptimizer is installed (once) and fire a background boost so Claude
+# starts with freshly-compressed .toon context + compacted agent descriptions.
+# Fail-open: never blocks launch.
+_projectwise_optimizer() {{
+  local opt="${{CLOPTIMIZER_BIN:-$HOME/.cargo/bin/cloptimizer}}"
+  [[ -x "$opt" ]] || return 0
   case "$OSTYPE" in
-    darwin*) [[ -f "$HOME/Library/LaunchAgents/com.tokenizer.plist" ]] || "$tok" install-timer >/dev/null 2>&1 ;;
-    *)       [[ -f "$HOME/.config/systemd/user/tokenizer.timer" ]]      || "$tok" install-timer >/dev/null 2>&1 ;;
+    darwin*) [[ -f "$HOME/Library/LaunchAgents/com.cloptimizer.plist" ]] || "$opt" install-timer >/dev/null 2>&1 ;;
+    *)       [[ -f "$HOME/.config/systemd/user/cloptimizer.timer" ]]      || "$opt" install-timer >/dev/null 2>&1 ;;
   esac
-  [[ -f "$HOME/.claude/hooks/tokenizer-post-session.sh" ]] || "$tok" install-hook >/dev/null 2>&1
-  ( "$tok" optimize --quiet >/dev/null 2>&1 & ) 2>/dev/null
+  [[ -f "$HOME/.claude/hooks/cloptimizer-post-session.sh" ]] || "$opt" install-hook >/dev/null 2>&1
+  # --claude-dir pins the global config dir so the headless boost never falls
+  # back to an interactive fzf directory picker on a fresh machine.
+  ( "$opt" optimize --quiet --claude-dir "$HOME/.claude" >/dev/null 2>&1 & ) 2>/dev/null
 }}
 
 # Launch Claude with the session interview directive (always) plus the context
@@ -4118,7 +4354,7 @@ _projectwise_launch() {{
 projectwise() {{
   command -v claude &>/dev/null || {{ echo "Error: claude CLI not found" >&2; return 127; }}
   local _pd="${{CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}}"
-  _projectwise_tokenizer
+  _projectwise_optimizer
   ( cpm rules-sync >/dev/null 2>&1 & ) 2>/dev/null     # keep readable rule mirror fresh (idempotent)
   # SessionEnd handoff hook is registered in-process by `cpm pre-launch` (below),
   # sequentially after guard_mcp_servers, so the two settings.json writers don't race.
@@ -4929,12 +5165,13 @@ mod tab_tests {
 
     #[test]
     fn tab_cycle_next_prev() {
-        assert_eq!(Tab::Projects.next(), Tab::Tokenizer);
+        assert_eq!(Tab::Projects.next(), Tab::Cloptimizer);
         assert_eq!(Tab::Rules.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::IntroPrompt);
         assert_eq!(Tab::IntroPrompt.next(), Tab::Projects);
         assert_eq!(Tab::Projects.prev(), Tab::IntroPrompt);
-        assert_eq!(Tab::Tokenizer.prev(), Tab::Projects);
+        assert_eq!(Tab::Cloptimizer.prev(), Tab::Projects);
+        assert_eq!(Tab::Cloptimizer.index(), 1);
         assert_eq!(Tab::ClaudeMd.index(), 2);
         assert_eq!(Tab::Agents.index(), 4);
         assert_eq!(Tab::IntroPrompt.index(), 5);
@@ -5180,6 +5417,56 @@ mod tab_tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn group_thousands_formats() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(60973), "60,973");
+        assert_eq!(group_thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn last_manifest_id_skips_corrupt_tail() {
+        // Corrupt/truncated last line must not mask the valid entry beneath it.
+        let jsonl = concat!(
+            r#"{"id":"conv_A","original_path":"/a"}"#, "\n",
+            r#"{"id":"conv_B","original_path":"/b"}"#, "\n",
+            r#"{"id":"conv_C","original_pa"#, // truncated crash line
+        );
+        assert_eq!(last_manifest_id_from(jsonl).as_deref(), Some("conv_B"));
+        // All-valid → the genuine last id.
+        let ok = concat!(r#"{"id":"x"}"#, "\n", r#"{"id":"y"}"#, "\n");
+        assert_eq!(last_manifest_id_from(ok).as_deref(), Some("y"));
+        // Empty / no ids → None (genuinely nothing to roll back).
+        assert_eq!(last_manifest_id_from("\n  \n"), None);
+        assert_eq!(last_manifest_id_from(r#"{"no":"id"}"#), None);
+    }
+
+    #[test]
+    fn parse_clopt_report_reads_real_shape() {
+        // The exact shape emitted by `cloptimizer report --json`.
+        let json = br#"{
+          "optimize": { "claude_dir": "/x", "convertible_bytes": 12,
+                        "convertible_files": 149, "tokens_saveable_est": 60973 },
+          "processes": { "attributed": 2, "claude_sessions": 5, "orphans": 23,
+                         "reapable": 6, "reapable_pids": [1,2], "reclaimable_rss_mb": 1105,
+                         "tracked": 33, "tracked_rss_mb": 2185, "zombies": 0 }
+        }"#;
+        let r = parse_clopt_report(json).expect("should parse");
+        assert_eq!(r.convertible_files, 149);
+        assert_eq!(r.tokens_saveable, 60973);
+        assert_eq!(r.claude_sessions, 5);
+        assert_eq!(r.orphans, 23);
+        assert_eq!(r.reapable, 6);
+        assert_eq!(r.reclaimable_mb, 1105);
+        assert_eq!(r.tracked_mb, 2185);
+        // Missing sections → None (not a panic); missing fields → 0.
+        assert!(parse_clopt_report(br#"{"optimize":{}}"#).is_none());
+        let partial = parse_clopt_report(br#"{"optimize":{},"processes":{}}"#).unwrap();
+        assert_eq!(partial.convertible_files, 0);
     }
 
     #[test]
